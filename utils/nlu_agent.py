@@ -56,6 +56,20 @@ Rules:
 }
 
 EMAIL_PATTERN = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+REMINDER_PARSE_SETTINGS = {
+    "TIMEZONE": "Asia/Kolkata",
+    "RETURN_AS_TIMEZONE_AWARE": False,
+    "PREFER_DATES_FROM": "future",
+}
+REMINDER_NOISE_TOKENS = {"to", "for", "on", "at", "in", "me", "a", "an"}
+REMINDER_SIGNAL_PATTERN = re.compile(
+    r"(?i)("
+    r"\d|am|pm|noon|midnight|"
+    r"today|tomorrow|tonight|next|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
+    r")"
+)
 
 
 def _clean_email_message_hint(text):
@@ -180,31 +194,48 @@ def _has_research_signal(lowered):
 
 
 def _extract_reminder_fields(user_input):
-    cleaned = re.sub(r"(?i)^\s*(remind me|set a reminder|set reminder|create a reminder)\s*", "", user_input).strip()
-    matches = search_dates(
-        cleaned,
-        settings={
-            "TIMEZONE": "Asia/Kolkata",
-            "RETURN_AS_TIMEZONE_AWARE": False,
-            "PREFER_DATES_FROM": "future",
-        },
-    ) or []
+    cleaned = re.sub(
+        r"(?i)^\s*(remind me|set a reminder|set reminder|create a reminder)\s*(?:to\s+)?",
+        "",
+        user_input,
+    ).strip()
+    matches = search_dates(cleaned, settings=REMINDER_PARSE_SETTINGS) or []
 
-    if not matches:
+    chosen_phrase = ""
+    for phrase, _ in matches:
+        candidate = " ".join((phrase or "").split()).strip(" ,.-")
+        lowered = candidate.lower()
+        if not candidate or lowered in REMINDER_NOISE_TOKENS:
+            continue
+        if not REMINDER_SIGNAL_PATTERN.search(candidate):
+            continue
+        chosen_phrase = candidate
+        break
+
+    if not chosen_phrase:
+        direct_phrase_match = re.search(
+            r"(?i)\b(?:on|at|by|for)\s+(.+)$",
+            cleaned,
+        )
+        if direct_phrase_match:
+            direct_phrase = direct_phrase_match.group(1).strip(" ,.-")
+            if direct_phrase and REMINDER_SIGNAL_PATTERN.search(direct_phrase):
+                chosen_phrase = direct_phrase
+
+    if not chosen_phrase:
         task_match = re.search(r"(?:to|for)\s+(.+)", cleaned, flags=re.IGNORECASE)
         return {
             "task": task_match.group(1).strip() if task_match else "Reminder",
             "time": "",
         }
 
-    time_phrase, _ = matches[0]
-    task = cleaned.replace(time_phrase, " ", 1)
-    task = re.sub(r"(?i)\b(to|for)\b", " ", task)
+    task = re.sub(re.escape(chosen_phrase), " ", cleaned, count=1, flags=re.IGNORECASE)
+    task = re.sub(r"(?i)\b(to|for|on|at|by)\b", " ", task)
     task = re.sub(r"\s+", " ", task).strip(" ,.-")
 
     return {
         "task": task or "Reminder",
-        "time": time_phrase.strip(),
+        "time": chosen_phrase,
     }
 
 

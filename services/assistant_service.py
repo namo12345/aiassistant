@@ -459,7 +459,19 @@ def _read_text_from_path(file_path):
     if suffix == ".pdf":
         pdf_doc = fitz.open(file_path)
         try:
-            return "\n".join(page.get_text() for page in pdf_doc)
+            pages = []
+            for page in pdf_doc:
+                page_text = page.get_text("text", sort=True).strip()
+                if len(page_text) < 80:
+                    block_text = "\n".join(
+                        block[4].strip()
+                        for block in page.get_text("blocks")
+                        if len(block) >= 5 and block[4].strip()
+                    )
+                    if len(block_text) > len(page_text):
+                        page_text = block_text.strip()
+                pages.append(page_text)
+            return "\n".join(part for part in pages if part)
         finally:
             pdf_doc.close()
 
@@ -497,7 +509,21 @@ def _summarize_file_bytes(filename, file_bytes, instruction=None):
         if not text:
             raise ValueError("No readable text was found in the file.")
 
+        suffix = Path(filename).suffix.lower()
         cleaned_text = _clean_extracted_text(text, MAX_DOCUMENT_BODY_CHARS)
+        if len(cleaned_text) < 60:
+            preview = _limit_text(cleaned_text or text, 180) or "No readable text was detected."
+            if suffix == ".pdf":
+                return (
+                    f"I could extract only limited text from {filename}. "
+                    f"Extracted text: {preview} "
+                    "This usually means the PDF is image-based/scanned. Upload a text-based PDF or DOCX for a reliable summary."
+                )
+            return (
+                f"I could extract only limited text from {filename}. "
+                f"Extracted text: {preview}"
+            )
+
         summary_instruction = instruction or (
             "Summarize the uploaded document in a concise way. "
             "Highlight the main idea, key facts, and any useful action items. Ignore boilerplate and duplicated blocks."
@@ -788,6 +814,12 @@ def set_reminder(title, when_text, description="", duration_minutes=60):
         try:
             service = _get_calendar_service()
             created_event = service.events().insert(calendarId="primary", body=event_body).execute()
+            event_link = created_event.get("htmlLink", "")
+            calendar_email = (
+                created_event.get("organizer", {}).get("email")
+                or created_event.get("creator", {}).get("email")
+                or ""
+            )
             export_text = "\n".join(
                 [
                     "Reminder set",
@@ -795,25 +827,38 @@ def set_reminder(title, when_text, description="", duration_minutes=60):
                     f"When: {when_label}",
                     f"Duration: {duration_minutes} minutes",
                     f"Description: {description or 'No description'}",
+                    f"Calendar: {calendar_email or 'primary'}",
+                    f"Open: {event_link or 'N/A'}",
                     "Backend: Google Calendar",
                 ]
             )
+            body_text = description or "No additional description."
+            if calendar_email:
+                body_text += f"\nCalendar: {calendar_email}"
+            if event_link:
+                body_text += f"\nOpen: {event_link}"
 
             return _success(
                 "reminder",
                 "Reminder set",
-                f'"{title}" is scheduled for {when_label}.',
+                f'"{title}" is scheduled for {when_label} on {calendar_email or "your primary calendar"}.',
                 items=[
                     {
                         "title": title,
                         "subtitle": when_label,
-                        "body": description or "No additional description.",
+                        "body": body_text,
                     }
                 ],
                 meta={
-                    "event_link": created_event.get("htmlLink", ""),
+                    "event_link": event_link,
+                    "calendar_email": calendar_email,
                     "reminder_backend": "google_calendar",
                 },
+                sources=(
+                    [{"title": "Open in Google Calendar", "url": event_link}]
+                    if event_link
+                    else []
+                ),
                 export_text=export_text,
             )
         except Exception as calendar_exc:
