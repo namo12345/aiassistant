@@ -3,155 +3,125 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>AutoPilot AI Workspace</title>
+    <title>AutoPilot AI</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fraunces:wght@600;700&family=IBM+Plex+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
     <div class="page-shell">
         <aside class="control-panel">
             <div class="brand-card panel-card">
-                <p class="eyebrow">Browser assistant</p>
                 <h1>AutoPilot AI</h1>
-                <p class="lede">
-                    A single-user workspace for mail, reminders, document summaries,
-                    and quick research without Telegram.
-                </p>
+                <p class="lede">Your productivity assistant</p>
                 <div class="brand-actions">
-                    <button type="button" class="secondary-button" id="theme-toggle">Switch theme</button>
+                    <button type="button" class="icon-btn" id="theme-toggle" title="Toggle theme">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+                    </button>
                     <div class="status-pill" id="status-pill">Ready</div>
                 </div>
             </div>
 
-            <section class="panel-card">
-                <div class="section-heading">
-                    <h2>Quick actions</h2>
-                    <p>Run a tool in one click.</p>
-                </div>
-                <div class="quick-grid">
-                    <button type="button" class="quick-action" data-action="mail-summary">Summarize mail</button>
-                    <button type="button" class="quick-action" data-open-form="research-form">Research topic</button>
-                    <button type="button" class="quick-action" data-open-form="reminder-form">Set reminder</button>
-                    <button type="button" class="quick-action" data-open-form="upload-form">Summarize file</button>
-                </div>
-            </section>
+            <details class="tool-panel" id="email-form">
+                <summary>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+                    Send email
+                </summary>
+                <form class="tool-form" data-endpoint="/api/email/send" data-user-label="Send email">
+                    <label>
+                        Recipient
+                        <input type="email" name="recipient" placeholder="name@example.com" required>
+                    </label>
+                    <label>
+                        Subject
+                        <input type="text" name="subject" placeholder="Project update">
+                    </label>
+                    <label>
+                        Message
+                        <textarea name="message" rows="4" placeholder="Optional. Leave empty to auto-draft the email."></textarea>
+                    </label>
+                    <label class="checkbox-row">
+                        <input type="checkbox" name="polish" checked>
+                        Polish with AI
+                    </label>
+                    <button type="submit" class="primary-button">Send</button>
+                </form>
+            </details>
 
-            <section class="panel-card">
-                <div class="section-heading">
-                    <h2>Prompt ideas</h2>
-                    <p>Drop one into chat and edit it.</p>
-                </div>
-                <div class="prompt-list">
-                    <button type="button" class="prompt-chip" data-prompt="Summarize my latest emails.">Summarize my latest emails</button>
-                    <button type="button" class="prompt-chip" data-prompt="Research retrieval augmented generation in simple terms.">Research retrieval augmented generation</button>
-                    <button type="button" class="prompt-chip" data-prompt="Remind me tomorrow at 8pm to call the client.">Create a reminder for tomorrow</button>
-                    <button type="button" class="prompt-chip" data-prompt="Send an email to example@email.com about tomorrow's meeting.">Draft and send an email</button>
-                </div>
-            </section>
+            <details class="tool-panel" id="reminder-form">
+                <summary>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                    Set reminder
+                </summary>
+                <form class="tool-form" data-endpoint="/api/reminder/create" data-user-label="Set reminder">
+                    <label>
+                        Title
+                        <input type="text" name="title" placeholder="Team sync" required>
+                    </label>
+                    <label>
+                        When
+                        <input type="text" name="when" placeholder="tomorrow 6pm" required>
+                    </label>
+                    <label>
+                        Description
+                        <textarea name="description" rows="2" placeholder="Optional details"></textarea>
+                    </label>
+                    <label>
+                        Duration (minutes)
+                        <input type="number" name="duration_minutes" min="15" max="720" value="60">
+                    </label>
+                    <button type="submit" class="primary-button">Create reminder</button>
+                </form>
+            </details>
 
-            <section class="panel-card tools-card">
-                <div class="section-heading">
-                    <h2>Tool forms</h2>
-                    <p>Use structured forms when you want more control.</p>
-                </div>
+            <details class="tool-panel" id="research-form">
+                <summary>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                    Research topic
+                </summary>
+                <form class="tool-form" data-endpoint="/api/research" data-user-label="Research topic">
+                    <label>
+                        Topic
+                        <input type="text" name="topic" placeholder="AI workflow automation" required>
+                    </label>
+                    <button type="submit" class="primary-button">Research</button>
+                </form>
+            </details>
 
-                <details class="tool-panel" id="email-form">
-                    <summary>Send email</summary>
-                    <form class="tool-form" data-endpoint="/api/email/send" data-user-label="Send email">
-                        <label>
-                            Recipient
-                            <input type="email" name="recipient" placeholder="name@example.com" required>
-                        </label>
-                        <label>
-                            Subject
-                            <input type="text" name="subject" placeholder="Project update">
-                        </label>
-                        <label>
-                            Message
-                            <textarea name="message" rows="5" placeholder="Write the draft you want polished and sent." required></textarea>
-                        </label>
-                        <label class="checkbox-row">
-                            <input type="checkbox" name="polish" checked>
-                            Polish with AI before sending
-                        </label>
-                        <button type="submit" class="primary-button">Send email</button>
-                    </form>
-                </details>
+            <details class="tool-panel" id="upload-form">
+                <summary>
+                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                    Summarize document
+                </summary>
+                <form class="tool-form" id="upload-tool-form" enctype="multipart/form-data" data-endpoint="/api/attachment/summarize" data-user-label="Summarize uploaded file">
+                    <label>
+                        File
+                        <input type="file" name="file" accept=".pdf,.docx,.csv,.txt,.md,.json,.html,.css,.js" required>
+                    </label>
+                    <button type="submit" class="primary-button">Summarize</button>
+                </form>
+            </details>
 
-                <details class="tool-panel" id="reminder-form">
-                    <summary>Set reminder</summary>
-                    <form class="tool-form" data-endpoint="/api/reminder/create" data-user-label="Set reminder">
-                        <label>
-                            Title
-                            <input type="text" name="title" placeholder="Team sync" required>
-                        </label>
-                        <label>
-                            When
-                            <input type="text" name="when" placeholder="tomorrow 6pm" required>
-                        </label>
-                        <label>
-                            Description
-                            <textarea name="description" rows="3" placeholder="Optional extra context"></textarea>
-                        </label>
-                        <label>
-                            Duration in minutes
-                            <input type="number" name="duration_minutes" min="15" max="720" value="60">
-                        </label>
-                        <button type="submit" class="primary-button">Create reminder</button>
-                    </form>
-                </details>
-
-                <details class="tool-panel" id="research-form">
-                    <summary>Research topic</summary>
-                    <form class="tool-form" data-endpoint="/api/research" data-user-label="Research topic">
-                        <label>
-                            Topic
-                            <input type="text" name="topic" placeholder="AI workflow automation" required>
-                        </label>
-                        <button type="submit" class="primary-button">Generate research brief</button>
-                    </form>
-                </details>
-
-                <details class="tool-panel" id="upload-form">
-                    <summary>Summarize document</summary>
-                    <form class="tool-form" id="upload-tool-form" enctype="multipart/form-data" data-endpoint="/api/attachment/summarize" data-user-label="Summarize uploaded file">
-                        <label>
-                            File
-                            <input type="file" name="file" accept=".pdf,.docx,.csv,.txt,.md,.json,.html,.css,.js" required>
-                        </label>
-                        <button type="submit" class="primary-button">Summarize file</button>
-                    </form>
-                </details>
-            </section>
+            <button type="button" class="quick-action" data-action="mail-summary">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
+                Summarize inbox
+            </button>
         </aside>
 
         <main class="conversation-panel">
-            <header class="conversation-header">
-                <div>
-                    <p class="eyebrow">Chat workspace</p>
-                    <h2>Ask the assistant directly</h2>
-                    <p>Chat history stays in this browser session. Copy or download any response you want to keep.</p>
-                </div>
-            </header>
-
             <div class="messages" id="messages" aria-live="polite"></div>
 
             <form class="composer" id="chat-form">
-                <label class="composer-label" for="chat-input">Command</label>
                 <div class="composer-row">
-                    <textarea id="chat-input" name="message" rows="2" placeholder="Ask for inbox summaries, research, reminders, or email sending." required></textarea>
+                    <textarea id="chat-input" name="message" rows="2" placeholder="Type a message or use the tools on the left..." required></textarea>
                     <div class="composer-actions">
-                        <button type="button" class="voice-button" id="voice-button" title="Hold or click to speak">
-                            <svg class="mic-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
-                            <span class="voice-label">Voice</span>
+                        <button type="button" class="voice-button" id="voice-button" title="Click to speak">
+                            <svg class="mic-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>
                         </button>
-                        <label class="voice-auto-send">
-                            <input type="checkbox" id="voice-auto-send" checked>
-                            Auto-send
-                        </label>
-                        <button type="submit" class="primary-button">Send</button>
+                        <button type="submit" class="send-button" title="Send">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                        </button>
                     </div>
                 </div>
             </form>

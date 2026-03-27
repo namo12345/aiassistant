@@ -5,3 +5,4 @@ data/*.json
 data/*.jsonl
 token.json
 credentials.json
+.playwright-mcp/

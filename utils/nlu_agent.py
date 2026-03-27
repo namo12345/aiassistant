@@ -55,6 +55,54 @@ Rules:
 """,
 }
 
+EMAIL_PATTERN = re.compile(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})")
+
+
+def _clean_email_message_hint(text):
+    message = (text or "").strip(" \t\r\n,.;:-")
+    if not message:
+        return ""
+
+    message = re.sub(r"(?i)^(?:that\s+)?(?:says?|saying|message|about|regarding)\s+", "", message).strip()
+    message = re.sub(r"(?i)^to\s+(?=ask\b|request\b|let\b|inform\b|invite\b|schedule\b|confirm\b|check\b|follow\s*up\b|see\b|join\b|meet\b|share\b|review\b|discuss\b)", "", message).strip()
+    message = re.sub(r"(?i)^please\s+", "", message).strip()
+    return message
+
+
+def _extract_email_fields(user_input):
+    text = (user_input or "").strip()
+    email_match = EMAIL_PATTERN.search(text)
+    email = email_match.group(1) if email_match else ""
+
+    message = ""
+    if email_match:
+        after_email = _clean_email_message_hint(text[email_match.end() :])
+        if after_email:
+            message = after_email
+
+    if not message:
+        patterns = (
+            r"(?i)\b(?:saying|that|message|about|regarding)\s+(.+)$",
+            r"(?i)\bto\s+(.+)$",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                message = _clean_email_message_hint(match.group(1))
+                if message:
+                    break
+
+    if not message:
+        without_email = EMAIL_PATTERN.sub(" ", text, count=1).strip() if email else text
+        without_command = re.sub(
+            r"(?i)^\s*(?:you\s+)?(?:please\s+)?(?:can you\s+|could you\s+)?(?:send(?:\s+an?)?\s+)?(?:mail|email)\b(?:\s+to)?\s*",
+            "",
+            without_email,
+        ).strip()
+        message = _clean_email_message_hint(without_command)
+
+    return {"email": email, "message": message}
+
 
 def _extract_json_block(content):
     cleaned = content.strip()
@@ -102,6 +150,15 @@ def _normalize_result(user_input, parsed):
             or normalized.get("task", "").strip().lower() in {"reminder", "set reminder"}
         ):
             normalized["task"] = reminder_fields["task"]
+    elif intent == "send_email":
+        email_fields = _extract_email_fields(user_input)
+        if email_fields["email"] and not normalized.get("email"):
+            normalized["email"] = email_fields["email"]
+        if email_fields["message"] and not normalized.get("message"):
+            normalized["message"] = email_fields["message"]
+        if not normalized.get("subject") and normalized.get("message"):
+            if re.search(r"(?i)\b(meeting|meet|schedule|call)\b", normalized["message"]):
+                normalized["subject"] = "Meeting request"
 
     return normalized
 
@@ -158,7 +215,7 @@ def _fallback_parse(user_input):
         intent = "deepresearch"
     elif "remind me" in lowered or "reminder" in lowered:
         intent = "reminder"
-    elif "send email" in lowered or "send mail" in lowered or "email " in lowered:
+    elif re.search(r"\bsend\b.*\b(mail|email)\b", lowered) or "email " in lowered:
         intent = "sendmail"
     elif "summary" in lowered or "summarize" in lowered:
         intent = "summary"
@@ -167,7 +224,7 @@ def _fallback_parse(user_input):
     else:
         intent = parse_intent(text)
 
-    email_match = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", text)
+    email_fields = _extract_email_fields(text)
 
     if intent == "summary":
         if any(word in lowered for word in ("attachment", "attachments", "document", "pdf", "doc", "file", "upload")):
@@ -175,12 +232,11 @@ def _fallback_parse(user_input):
         return {"intent": "summarize_mails"}
 
     if intent == "sendmail":
-        message_match = re.search(r"(?:saying|that|message)\s+(.+)", text, flags=re.IGNORECASE)
         return {
             "intent": "send_email",
-            "email": email_match.group(1) if email_match else "",
+            "email": email_fields["email"],
             "subject": "",
-            "message": message_match.group(1).strip() if message_match else text,
+            "message": email_fields["message"],
         }
 
     if intent == "reminder":

@@ -1,12 +1,14 @@
 import base64
 import html
+import json
 import mimetypes
 import os
 import re
 import tempfile
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
+from uuid import uuid4
 
 import dateparser
 import docx
@@ -39,6 +41,7 @@ MAX_SUMMARY_CHARS = 4000
 MAX_RESEARCH_CHARS = 12000
 MAX_EMAIL_BODY_CHARS = 1800
 MAX_DOCUMENT_BODY_CHARS = 2200
+LOCAL_REMINDER_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "local_reminders.jsonl"
 
 EMAIL_BOILERPLATE_MARKERS = (
     "unsubscribe",
@@ -520,6 +523,64 @@ def _build_gmail_message(recipient, subject, body_text):
     return {"raw": encoded}
 
 
+def _is_calendar_auth_error(exc):
+    lowered = str(exc).lower()
+    return (
+        "invalid_grant" in lowered
+        or "missing google credentials" in lowered
+        or "google calendar authentication failed" in lowered
+    )
+
+
+def _store_local_reminder(title, when_iso, description, duration_minutes, error_text):
+    LOCAL_REMINDER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    reminder_id = uuid4().hex
+    payload = {
+        "id": reminder_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "title": title,
+        "when": when_iso,
+        "description": description,
+        "duration_minutes": duration_minutes,
+        "error": error_text,
+    }
+    with LOCAL_REMINDER_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\n")
+    return payload
+
+
+def _infer_email_subject(subject, message):
+    cleaned_subject = (subject or "").strip()
+    if cleaned_subject:
+        return cleaned_subject
+
+    lowered = (message or "").lower()
+    if re.search(r"\b(meeting|meet|schedule|call)\b", lowered):
+        return "Meeting request"
+    if re.search(r"\b(follow up|follow-up)\b", lowered):
+        return "Follow-up"
+    if re.search(r"\b(update|status)\b", lowered):
+        return "Quick update"
+    return "Message from AutoPilot AI"
+
+
+def _default_email_draft(subject):
+    lowered = (subject or "").lower()
+    if re.search(r"\b(meeting|meet|schedule|call)\b", lowered):
+        return (
+            "Hi,\n\n"
+            "I hope you're doing well. Could we schedule a meeting tomorrow morning? "
+            "Please share a time that works for you.\n\n"
+            "Best regards,"
+        )
+
+    return (
+        "Hi,\n\n"
+        "I hope you're doing well. Please let me know a convenient time to connect.\n\n"
+        "Best regards,"
+    )
+
+
 def _attachment_summaries(service, message_id, payload):
     summaries = []
     for part in _iter_attachment_parts(payload):
@@ -639,23 +700,24 @@ def send_email_message(recipient, subject, message, polish=True):
     message = (message or "").strip()
     strategy = select_strategy("email_polish")
 
-    if not recipient or not message:
+    if not recipient:
         return _error(
-            "Recipient and message are required before sending email.",
+            "Recipient is required before sending email.",
             title="Missing email fields",
         )
 
     try:
         service = _get_gmail_service(GMAIL_SEND_SCOPE)
-        final_subject = subject or "Message from AutoPilot AI"
+        draft_message = message or _default_email_draft(subject)
+        final_subject = _infer_email_subject(subject, draft_message)
         final_body = (
             polish_message(
-                message,
+                draft_message,
                 subject=final_subject,
                 instruction=get_prompt_variant("email_polish", strategy),
             )
             if polish
-            else message
+            else draft_message
         )
         gmail_message = _build_gmail_message(recipient, final_subject, final_body)
         service.users().messages().send(userId="me", body=gmail_message).execute()
@@ -714,40 +776,87 @@ def set_reminder(title, when_text, description="", duration_minutes=60):
 
         duration_minutes = max(15, min(int(duration_minutes or 60), 720))
         end_time = parsed_time + timedelta(minutes=duration_minutes)
-        service = _get_calendar_service()
+        when_label = parsed_time.strftime("%d %b %Y, %I:%M %p")
+
         event_body = {
             "summary": title,
             "description": description,
             "start": {"dateTime": parsed_time.isoformat(), "timeZone": "Asia/Kolkata"},
             "end": {"dateTime": end_time.isoformat(), "timeZone": "Asia/Kolkata"},
         }
-        created_event = service.events().insert(calendarId="primary", body=event_body).execute()
-        when_label = parsed_time.strftime("%d %b %Y, %I:%M %p")
 
-        export_text = "\n".join(
-            [
+        try:
+            service = _get_calendar_service()
+            created_event = service.events().insert(calendarId="primary", body=event_body).execute()
+            export_text = "\n".join(
+                [
+                    "Reminder set",
+                    f"Title: {title}",
+                    f"When: {when_label}",
+                    f"Duration: {duration_minutes} minutes",
+                    f"Description: {description or 'No description'}",
+                    "Backend: Google Calendar",
+                ]
+            )
+
+            return _success(
+                "reminder",
                 "Reminder set",
-                f"Title: {title}",
-                f"When: {when_label}",
-                f"Duration: {duration_minutes} minutes",
-                f"Description: {description or 'No description'}",
-            ]
-        )
+                f'"{title}" is scheduled for {when_label}.',
+                items=[
+                    {
+                        "title": title,
+                        "subtitle": when_label,
+                        "body": description or "No additional description.",
+                    }
+                ],
+                meta={
+                    "event_link": created_event.get("htmlLink", ""),
+                    "reminder_backend": "google_calendar",
+                },
+                export_text=export_text,
+            )
+        except Exception as calendar_exc:
+            if not _is_calendar_auth_error(calendar_exc):
+                raise
 
-        return _success(
-            "reminder",
-            "Reminder set",
-            f'"{title}" is scheduled for {when_label}.',
-            items=[
-                {
-                    "title": title,
-                    "subtitle": when_label,
-                    "body": description or "No additional description.",
-                }
-            ],
-            meta={"event_link": created_event.get("htmlLink", "")},
-            export_text=export_text,
-        )
+            local_reminder = _store_local_reminder(
+                title,
+                parsed_time.isoformat(),
+                description,
+                duration_minutes,
+                str(calendar_exc),
+            )
+            export_text = "\n".join(
+                [
+                    "Reminder saved locally",
+                    f"Title: {title}",
+                    f"When: {when_label}",
+                    f"Duration: {duration_minutes} minutes",
+                    f"Description: {description or 'No description'}",
+                    "Backend: Local fallback",
+                    "Reason: Google Calendar is unavailable right now.",
+                ]
+            )
+
+            return _success(
+                "reminder",
+                "Reminder saved locally",
+                f'"{title}" is saved for {when_label}. Google Calendar is unavailable right now.',
+                items=[
+                    {
+                        "title": title,
+                        "subtitle": when_label,
+                        "body": (description or "No additional description.") + " (Stored locally)",
+                    }
+                ],
+                meta={
+                    "event_link": "",
+                    "reminder_backend": "local_fallback",
+                    "local_id": local_reminder["id"],
+                },
+                export_text=export_text,
+            )
     except Exception as exc:
         return _error(str(exc), title="Could not create reminder")
 
