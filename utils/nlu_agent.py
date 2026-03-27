@@ -62,6 +62,22 @@ REMINDER_PARSE_SETTINGS = {
     "PREFER_DATES_FROM": "future",
 }
 REMINDER_NOISE_TOKENS = {"to", "for", "on", "at", "in", "me", "a", "an"}
+REMINDER_MONTH_PATTERN = (
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+)
+REMINDER_EXPLICIT_DAY_MONTH_PATTERN = re.compile(
+    rf"(?i)\b(\d{{1,2}}(?:st|nd|rd|th)?\s+{REMINDER_MONTH_PATTERN}(?:\s+\d{{4}})?)\b"
+)
+REMINDER_EXPLICIT_MONTH_DAY_PATTERN = re.compile(
+    rf"(?i)\b({REMINDER_MONTH_PATTERN}\s+\d{{1,2}}(?:st|nd|rd|th)?(?:\s+\d{{4}})?)\b"
+)
+REMINDER_EXPLICIT_TIME_PATTERN = re.compile(
+    r"(?i)\b("
+    r"\d{1,2}(?::\d{2})?\s*(?:a\.?m\.?|p\.?m\.?)|"
+    r"noon|midnight"
+    r")\b"
+)
 REMINDER_TIME_COMPONENT_PATTERN = re.compile(
     r"(?i)\b("
     r"\d{1,2}(:\d{2})?\s*(a\.?m\.?|p\.?m\.?)|"
@@ -239,11 +255,24 @@ def _extract_reminder_fields(user_input):
             continue
         candidates.append((candidate, parsed))
 
+    explicit_date_match = (
+        REMINDER_EXPLICIT_DAY_MONTH_PATTERN.search(cleaned)
+        or REMINDER_EXPLICIT_MONTH_DAY_PATTERN.search(cleaned)
+    )
+    explicit_time_match = REMINDER_EXPLICIT_TIME_PATTERN.search(cleaned)
+
     chosen_phrase = ""
+    if explicit_date_match and explicit_time_match:
+        explicit_date = " ".join(explicit_date_match.group(1).split())
+        explicit_time = " ".join(explicit_time_match.group(1).split())
+        chosen_phrase = f"{explicit_time} on {explicit_date}"
+
     time_candidate = ""
     date_candidate = ""
 
     for candidate, _ in candidates:
+        if chosen_phrase:
+            break
         has_time = _has_time_component(candidate)
         has_date = _has_date_component(candidate)
         if has_time and not time_candidate:
