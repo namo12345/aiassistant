@@ -37,10 +37,10 @@ GMAIL_READONLY_SCOPE = ["https://www.googleapis.com/auth/gmail.readonly"]
 GMAIL_SEND_SCOPE = ["https://www.googleapis.com/auth/gmail.send"]
 CALENDAR_SCOPE = ["https://www.googleapis.com/auth/calendar.events"]
 
-MAX_SUMMARY_CHARS = 4000
+MAX_SUMMARY_CHARS = 12000
 MAX_RESEARCH_CHARS = 12000
 MAX_EMAIL_BODY_CHARS = 1800
-MAX_DOCUMENT_BODY_CHARS = 2200
+MAX_DOCUMENT_BODY_CHARS = 9000
 _DATA_ROOT = Path("/tmp") if os.getenv("VERCEL") else Path(__file__).resolve().parent.parent / "data"
 LOCAL_REMINDER_LOG_PATH = _DATA_ROOT / "local_reminders.jsonl"
 
@@ -567,13 +567,19 @@ def _summarize_file_bytes(filename, file_bytes, instruction=None):
             )
 
         summary_instruction = instruction or (
-            "Summarize the uploaded document in a concise way. "
-            "Highlight the main idea, key facts, and any useful action items. Ignore boilerplate and duplicated blocks."
+            "You are summarizing a document the user uploaded. "
+            "Write a clear, helpful summary in this exact structure:\n"
+            "1) One opening paragraph (2-4 sentences) explaining what the document is and its main point.\n"
+            "2) A short bulleted list titled 'Key points:' with 3-6 bullets capturing the most important facts, numbers, or arguments.\n"
+            "3) If the document contains tasks, deadlines, or asks, add a section 'Action items:' with bullets. "
+            "Skip this section if there are none.\n"
+            "Do NOT just repeat headings or the title. Do NOT output HTML. "
+            "Ignore boilerplate, page numbers, and duplicated text."
         )
 
         try:
             summary = chat_completion(summary_instruction, cleaned_text[:MAX_SUMMARY_CHARS])
-            if _summary_looks_noisy(summary):
+            if _summary_looks_noisy(summary, max_chars=4000):
                 return _fallback_document_summary(filename, cleaned_text)
             return summary
         except Exception:
