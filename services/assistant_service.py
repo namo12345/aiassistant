@@ -22,6 +22,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 from services.reinforcement_service import attach_trace, get_prompt_variant, select_strategy
+from services.supabase_client import get_supabase
 from utils.deep_research_agent import search_web
 from utils.llm_util import chat_completion, polish_message, summarize_text
 from utils.nlu_agent import parse_intent_with_llm
@@ -388,32 +389,41 @@ def _build_google_service(api_name, version, client_id, client_secret, refresh_t
     return build(api_name, version, credentials=credentials, cache_discovery=False)
 
 
-def _get_gmail_service(scopes):
+def _user_refresh_token(user):
+    token = (user or {}).get("refresh_token")
+    if not token:
+        raise ValueError(
+            "You are not connected to Google. Please sign in again to grant access."
+        )
+    return token
+
+
+def _get_gmail_service(user, scopes):
     return _build_google_service(
         "gmail",
         "v1",
         os.getenv("GOOGLE_CLIENT_ID"),
         os.getenv("GOOGLE_CLIENT_SECRET"),
-        os.getenv("GOOGLE_REFRESH_TOKEN"),
+        _user_refresh_token(user),
         scopes,
     )
 
 
-def _get_gmail_account_email():
-    configured = (os.getenv("GOOGLE_ACCOUNT_EMAIL") or "").strip()
-    if configured:
-        return configured
+def _get_gmail_account_email(user):
+    email = (user or {}).get("email", "")
+    if email:
+        return email.strip()
 
     try:
-        service = _get_gmail_service(GMAIL_READONLY_SCOPE)
+        service = _get_gmail_service(user, GMAIL_READONLY_SCOPE)
         profile = service.users().getProfile(userId="me").execute()
         return (profile.get("emailAddress") or "").strip()
     except Exception:
         return ""
 
 
-def _send_reminder_to_gmail(title, when_label, when_iso, description, duration_minutes):
-    recipient = _get_gmail_account_email()
+def _send_reminder_to_gmail(user, title, when_label, when_iso, description, duration_minutes):
+    recipient = _get_gmail_account_email(user)
     if not recipient:
         raise ValueError("No Gmail account email is available for reminder fallback.")
 
@@ -429,7 +439,7 @@ def _send_reminder_to_gmail(title, when_label, when_iso, description, duration_m
     ]
     body = "\n".join(body_lines)
 
-    service = _get_gmail_service(GMAIL_SEND_SCOPE)
+    service = _get_gmail_service(user, GMAIL_SEND_SCOPE)
     gmail_message = _build_gmail_message(recipient, subject, body)
     result = service.users().messages().send(userId="me", body=gmail_message).execute()
     return {
@@ -440,13 +450,13 @@ def _send_reminder_to_gmail(title, when_label, when_iso, description, duration_m
     }
 
 
-def _get_calendar_service():
+def _get_calendar_service(user):
     return _build_google_service(
         "calendar",
         "v3",
-        os.getenv("CALENDAR_CLIENT_ID"),
-        os.getenv("CALENDAR_CLIENT_SECRET"),
-        os.getenv("CALENDAR_REFRESH_TOKEN"),
+        os.getenv("GOOGLE_CLIENT_ID"),
+        os.getenv("GOOGLE_CLIENT_SECRET"),
+        _user_refresh_token(user),
         CALENDAR_SCOPE,
     )
 
@@ -606,7 +616,29 @@ def _is_calendar_auth_error(exc):
     )
 
 
-def _store_local_reminder(title, when_iso, description, duration_minutes, error_text):
+def _store_local_reminder(user_id, title, when_iso, description, duration_minutes, error_text):
+    try:
+        client = get_supabase()
+        response = (
+            client.table("reminders")
+            .insert(
+                {
+                    "user_id": user_id,
+                    "title": title,
+                    "when_iso": when_iso,
+                    "description": description,
+                    "duration_minutes": duration_minutes,
+                    "source": "fallback",
+                }
+            )
+            .execute()
+        )
+        if response.data:
+            return {"id": response.data[0]["id"]}
+    except Exception:
+        pass
+
+    # Best-effort local JSONL fallback if Supabase is unreachable
     LOCAL_REMINDER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     reminder_id = uuid4().hex
     payload = {
@@ -704,13 +736,14 @@ def _attachment_summaries(service, message_id, payload):
     return summaries
 
 
-def summarize_inbox(limit=5):
+def summarize_inbox(user, limit=5):
     if limit < 1:
         limit = 1
-    strategy = select_strategy("inbox_summary")
+    user_id = user["id"]
+    strategy = select_strategy(user_id, "inbox_summary")
 
     try:
-        service = _get_gmail_service(GMAIL_READONLY_SCOPE)
+        service = _get_gmail_service(user, GMAIL_READONLY_SCOPE)
         result = (
             service.users()
             .messages()
@@ -781,6 +814,7 @@ def summarize_inbox(limit=5):
                 meta={"count": len(items)},
                 export_text="\n\n".join(export_sections),
             ),
+            user_id,
             "inbox_summary",
             strategy,
             {"limit": limit},
@@ -789,11 +823,12 @@ def summarize_inbox(limit=5):
         return _error(str(exc), title="Could not summarize inbox")
 
 
-def send_email_message(recipient, subject, message, polish=True):
+def send_email_message(user, recipient, subject, message, polish=True):
     recipient = (recipient or "").strip()
     subject = (subject or "").strip()
     message = (message or "").strip()
-    strategy = select_strategy("email_polish")
+    user_id = user["id"]
+    strategy = select_strategy(user_id, "email_polish")
 
     if not recipient:
         return _error(
@@ -802,10 +837,10 @@ def send_email_message(recipient, subject, message, polish=True):
         )
 
     try:
-        service = _get_gmail_service(GMAIL_SEND_SCOPE)
+        service = _get_gmail_service(user, GMAIL_SEND_SCOPE)
         draft_message = message or _default_email_draft(subject)
         final_subject = _infer_email_subject(subject, draft_message)
-        sender_name = os.getenv("SENDER_NAME") or _derive_name_from_email(os.getenv("GMAIL_USER", ""))
+        sender_name = (user.get("name") or "").strip() or _derive_name_from_email(user.get("email", ""))
         recipient_name = _derive_name_from_email(recipient)
         polish_skipped_reason = ""
         if polish:
@@ -858,6 +893,7 @@ def send_email_message(recipient, subject, message, polish=True):
                 },
                 export_text=export_text,
             ),
+            user_id,
             "email_polish",
             strategy,
             {"recipient": recipient, "subject": final_subject, "polish": polish and not polish_skipped_reason},
@@ -866,10 +902,11 @@ def send_email_message(recipient, subject, message, polish=True):
         return _error(str(exc), title="Could not send email")
 
 
-def set_reminder(title, when_text, description="", duration_minutes=60):
+def set_reminder(user, title, when_text, description="", duration_minutes=60):
     title = (title or "").strip()
     when_text = (when_text or "").strip()
     description = (description or "").strip()
+    user_id = user["id"]
 
     if not title or not when_text:
         return _error(
@@ -897,7 +934,7 @@ def set_reminder(title, when_text, description="", duration_minutes=60):
         }
 
         try:
-            service = _get_calendar_service()
+            service = _get_calendar_service(user)
             created_event = service.events().insert(calendarId="primary", body=event_body).execute()
             event_link = created_event.get("htmlLink", "")
             calendar_email = (
@@ -952,6 +989,7 @@ def set_reminder(title, when_text, description="", duration_minutes=60):
 
             try:
                 fallback_email = _send_reminder_to_gmail(
+                    user,
                     title,
                     when_label,
                     parsed_time.isoformat(),
@@ -995,6 +1033,7 @@ def set_reminder(title, when_text, description="", duration_minutes=60):
                 pass
 
             local_reminder = _store_local_reminder(
+                user_id,
                 title,
                 parsed_time.isoformat(),
                 description,
@@ -1035,9 +1074,10 @@ def set_reminder(title, when_text, description="", duration_minutes=60):
         return _error(str(exc), title="Could not create reminder")
 
 
-def research_topic(topic):
+def research_topic(user, topic):
     topic = (topic or "").strip()
-    strategy = select_strategy("research_brief")
+    user_id = user["id"]
+    strategy = select_strategy(user_id, "research_brief")
     if not topic:
         return _error("Enter a topic before starting research.", title="Missing topic")
 
@@ -1084,6 +1124,7 @@ def research_topic(topic):
                 sources=sources,
                 export_text=export_text,
             ),
+            user_id,
             "research_brief",
             strategy,
             {"topic": topic},
@@ -1092,9 +1133,10 @@ def research_topic(topic):
         return _error(str(exc), title="Could not complete research")
 
 
-def summarize_uploaded_file(filename, file_bytes):
+def summarize_uploaded_file(user, filename, file_bytes):
     filename = (filename or "").strip()
-    strategy = select_strategy("attachment_summary")
+    user_id = user["id"]
+    strategy = select_strategy(user_id, "attachment_summary")
     if not filename:
         return _error("Choose a file to summarize.", title="Missing file")
 
@@ -1121,6 +1163,7 @@ def summarize_uploaded_file(filename, file_bytes):
         )
         return attach_trace(
             payload,
+            user_id,
             "attachment_summary",
             strategy,
             {"filename": filename},
@@ -1143,10 +1186,12 @@ def _general_chat(message):
         return _error(str(exc), title="Could not respond")
 
 
-def handle_command(message, context=None):
+def handle_command(user, message, context=None):
     message = (message or "").strip()
     if not message:
         return _error("Type a request before sending it.", title="Empty message")
+
+    user_id = user["id"]
 
     has_context = bool(context)
     if GREETING_PATTERNS.match(message) and not has_context:
@@ -1155,14 +1200,15 @@ def handle_command(message, context=None):
         response["response"]["meta"]["routing_strategy"] = "direct"
         return response
 
-    routing_strategy = select_strategy("intent_routing")
+    routing_strategy = select_strategy(user_id, "intent_routing")
     parsed = parse_intent_with_llm(message, strategy=routing_strategy, context=context)
     intent = parsed.get("intent", "unknown")
 
     if intent == "summarize_mails":
-        response = summarize_inbox()
+        response = summarize_inbox(user)
     elif intent == "send_email":
         response = send_email_message(
+            user,
             parsed.get("email", ""),
             parsed.get("subject", ""),
             parsed.get("message", ""),
@@ -1170,12 +1216,13 @@ def handle_command(message, context=None):
         )
     elif intent == "set_reminder":
         response = set_reminder(
+            user,
             parsed.get("task", "Reminder"),
             parsed.get("time", ""),
             parsed.get("description", ""),
         )
     elif intent in {"do_research", "research"}:
-        response = research_topic(parsed.get("topic") or message)
+        response = research_topic(user, parsed.get("topic") or message)
     elif intent == "summarize_attachments":
         response = _error(
             "Use the file upload tool to summarize attachments in the browser app.",

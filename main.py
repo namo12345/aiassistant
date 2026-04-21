@@ -1,7 +1,16 @@
 import os
+from functools import wraps
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 
 from services.assistant_service import (
     handle_command,
@@ -11,17 +20,46 @@ from services.assistant_service import (
     summarize_inbox,
     summarize_uploaded_file,
 )
+from services.auth_service import (
+    build_authorize_url,
+    complete_oauth,
+    new_state_token,
+)
 from services.reinforcement_service import get_learning_status, record_feedback
+from services.user_service import get_user
 
 load_dotenv()
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+app.secret_key = os.getenv("FLASK_SECRET_KEY") or "dev-only-change-me"
+app.config["SESSION_COOKIE_SECURE"] = os.getenv("VERCEL") == "1"
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 
 def _payload_response(payload):
     status_code = 200 if payload.get("ok") else 400
     return jsonify(payload), status_code
+
+
+def _current_user():
+    user_id = session.get("user_id")
+    if not user_id:
+        return None
+    return get_user(user_id)
+
+
+def require_auth(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        user = _current_user()
+        if not user:
+            return jsonify({"ok": False, "error": "unauthenticated"}), 401
+        request.current_user = user
+        return fn(*args, **kwargs)
+
+    return wrapped
 
 
 @app.get("/")
@@ -34,17 +72,76 @@ def health():
     return jsonify({"ok": True, "app": "autopilot-ai-assistant"})
 
 
+# ===== AUTH =====
+
+@app.get("/login")
+def login():
+    state = new_state_token()
+    session["oauth_state"] = state
+    return redirect(build_authorize_url(state))
+
+
+@app.get("/oauth/callback")
+def oauth_callback():
+    received_state = request.args.get("state", "")
+    expected_state = session.pop("oauth_state", None)
+    if not received_state or received_state != expected_state:
+        return render_template("index.html", oauth_error="Invalid OAuth state. Please try signing in again."), 400
+
+    code = request.args.get("code", "")
+    if not code:
+        return render_template("index.html", oauth_error="No authorization code received."), 400
+
+    try:
+        user = complete_oauth(code)
+    except Exception as exc:
+        return render_template("index.html", oauth_error=f"Sign-in failed: {exc}"), 400
+
+    session["user_id"] = user["id"]
+    return redirect(url_for("index"))
+
+
+@app.post("/logout")
+def logout():
+    session.clear()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/me")
+def me():
+    user = _current_user()
+    if not user:
+        return jsonify({"ok": False, "authenticated": False}), 401
+    return jsonify(
+        {
+            "ok": True,
+            "authenticated": True,
+            "user": {
+                "id": user["id"],
+                "email": user["email"],
+                "name": user.get("name") or user["email"],
+                "picture_url": user.get("picture_url") or "",
+            },
+        }
+    )
+
+
+# ===== CORE FEATURES (all require auth) =====
+
 @app.get("/api/mail/summary")
+@require_auth
 def mail_summary():
     limit = request.args.get("limit", default=5, type=int)
-    return _payload_response(summarize_inbox(limit))
+    return _payload_response(summarize_inbox(request.current_user, limit))
 
 
 @app.post("/api/email/send")
+@require_auth
 def email_send():
     payload = request.get_json(silent=True) or {}
     return _payload_response(
         send_email_message(
+            request.current_user,
             payload.get("recipient", ""),
             payload.get("subject", ""),
             payload.get("message", ""),
@@ -54,10 +151,12 @@ def email_send():
 
 
 @app.post("/api/reminder/create")
+@require_auth
 def reminder_create():
     payload = request.get_json(silent=True) or {}
     return _payload_response(
         set_reminder(
+            request.current_user,
             payload.get("title", ""),
             payload.get("when", ""),
             payload.get("description", ""),
@@ -67,12 +166,16 @@ def reminder_create():
 
 
 @app.post("/api/research")
+@require_auth
 def research():
     payload = request.get_json(silent=True) or {}
-    return _payload_response(research_topic(payload.get("topic", "")))
+    return _payload_response(
+        research_topic(request.current_user, payload.get("topic", ""))
+    )
 
 
 @app.post("/api/attachment/summarize")
+@require_auth
 def attachment_summarize():
     upload = request.files.get("file")
     if upload is None:
@@ -91,14 +194,18 @@ def attachment_summarize():
             }
         )
 
-    return _payload_response(summarize_uploaded_file(upload.filename, upload.read()))
+    return _payload_response(
+        summarize_uploaded_file(request.current_user, upload.filename, upload.read())
+    )
 
 
 @app.post("/api/command")
+@require_auth
 def command():
     payload = request.get_json(silent=True) or {}
     return _payload_response(
         handle_command(
+            request.current_user,
             payload.get("message", ""),
             context=payload.get("context") or [],
         )
@@ -106,9 +213,11 @@ def command():
 
 
 @app.post("/api/feedback")
+@require_auth
 def feedback():
     payload = request.get_json(silent=True) or {}
     result = record_feedback(
+        request.current_user["id"],
         payload.get("trace_id", ""),
         payload.get("reward", 0),
         label=payload.get("label", ""),
@@ -118,8 +227,9 @@ def feedback():
 
 
 @app.get("/api/learning/status")
+@require_auth
 def learning_status():
-    return jsonify(get_learning_status())
+    return jsonify(get_learning_status(request.current_user["id"]))
 
 
 if __name__ == "__main__":

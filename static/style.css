@@ -558,6 +558,196 @@ textarea { resize: none; }
     30% { opacity: 1; transform: translateY(-2px); }
 }
 
+/* Login screen */
+.login-screen {
+    min-height: 100vh;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background:
+        radial-gradient(circle at 20% 20%, var(--accent-soft), transparent 55%),
+        radial-gradient(circle at 80% 80%, color-mix(in srgb, var(--accent) 16%, transparent), transparent 55%),
+        var(--bg);
+}
+.login-screen[hidden] { display: none; }
+
+.login-card {
+    width: min(420px, 100%);
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    box-shadow: var(--shadow-lg);
+    padding: 36px 32px 30px;
+    text-align: center;
+    display: grid;
+    gap: 14px;
+    animation: slide-up 260ms ease-out;
+}
+.login-mark {
+    width: 54px;
+    height: 54px;
+    border-radius: 18px;
+    font-size: 22px;
+    margin: 0 auto 4px;
+}
+.login-card h1 {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+}
+.login-tagline {
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.55;
+    max-width: 32ch;
+    margin: 0 auto;
+}
+.google-signin {
+    margin: 10px auto 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 11px 22px;
+    border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    background: var(--surface);
+    color: var(--text);
+    font-size: 14px;
+    font-weight: 600;
+    text-decoration: none;
+    box-shadow: var(--shadow-sm);
+    transition: all 140ms ease;
+}
+.google-signin:hover {
+    background: var(--surface-alt);
+    border-color: var(--accent);
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-md);
+}
+.google-signin svg { flex-shrink: 0; }
+.login-note {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+    margin-top: 6px;
+}
+
+.oauth-error-banner {
+    position: fixed;
+    top: 14px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 60;
+    background: color-mix(in srgb, var(--danger) 12%, var(--surface-raised));
+    color: var(--danger);
+    border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+    padding: 10px 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 500;
+    box-shadow: var(--shadow-md);
+    max-width: 90%;
+    text-align: center;
+}
+
+/* User menu */
+.user-menu {
+    position: relative;
+}
+.user-avatar {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent-hover));
+    color: #fff;
+    font-weight: 700;
+    font-size: 13px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--border);
+    transition: transform 140ms ease, box-shadow 140ms ease;
+}
+.user-avatar:hover {
+    transform: scale(1.04);
+    box-shadow: var(--shadow-sm);
+}
+.user-dropdown {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    min-width: 220px;
+    background: var(--surface-raised);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: var(--shadow-lg);
+    padding: 6px;
+    z-index: 30;
+    animation: fade-in 140ms ease-out;
+}
+.user-dropdown[hidden] { display: none; }
+.user-info {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 4px;
+}
+.user-name {
+    font-size: 13.5px;
+    font-weight: 600;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.user-email {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.user-dropdown-item {
+    width: 100%;
+    text-align: left;
+    padding: 9px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    color: var(--text-soft);
+    transition: background 120ms ease, color 120ms ease;
+}
+.user-dropdown-item:hover {
+    background: var(--surface-alt);
+    color: var(--text);
+}
+
+/* Feedback buttons (thumbs) */
+.feedback-btn {
+    font-size: 12px;
+    padding: 5px 8px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--muted);
+    transition: all 120ms ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+}
+.feedback-btn:hover:not(:disabled) {
+    background: var(--surface-alt);
+    color: var(--text);
+    border-color: var(--border-strong);
+}
+.feedback-btn.active {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+}
+.feedback-btn:disabled {
+    cursor: default;
+    opacity: 0.85;
+}
+
 /* Mobile */
 @media (max-width: 640px) {
     .app { padding: 0 10px; }
@@ -565,4 +755,6 @@ textarea { resize: none; }
     .brand-text p { display: none; }
     .chat { padding: 14px 2px 18px; }
     .composer-hint { display: none; }
+    .login-card { padding: 28px 22px 24px; }
+    .user-dropdown { right: -4px; min-width: 200px; }
 }

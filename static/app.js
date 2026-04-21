@@ -31,11 +31,24 @@ const modalBody = document.getElementById("modal-body");
 const modalTitle = document.getElementById("modal-title");
 const modalClose = document.getElementById("modal-close");
 
+// Auth + user menu elements
+const loginScreen = document.getElementById("login-screen");
+const appShell = document.getElementById("app-shell");
+const userMenu = document.getElementById("user-menu");
+const userAvatar = document.getElementById("user-avatar");
+const userDropdown = document.getElementById("user-dropdown");
+const userNameEl = document.getElementById("user-name");
+const userEmailEl = document.getElementById("user-email");
+const userAvatarLetter = document.getElementById("user-avatar-letter");
+const logoutButton = document.getElementById("logout-button");
+
 let messages = [];
 let recognition = null;
 let currentUtterance = null;
 let autoSpeak = false;
 let isWorking = false;
+let currentUser = null;
+let feedbackState = {}; // trace_id -> {reward, label}
 
 // -- Storage ---------------------------------------------------------------
 function saveMessages() {
@@ -110,17 +123,17 @@ function buildErrorPayload(title, text, hint = "") {
 
 function friendlyErrorHint(text) {
     const lowered = (text || "").toLowerCase();
-    if (lowered.includes("invalid_grant") || lowered.includes("missing google credentials")) {
-        return "Tip: regenerate your Google refresh tokens by running `python generate_token.py` (Gmail) or `python generate_calendar_token.py` (Calendar) locally, then paste them into your .env file.";
+    if (lowered.includes("invalid_grant") || lowered.includes("missing google credentials") || lowered.includes("no refresh token")) {
+        return "Tip: sign out and sign in again so Google can re-issue a fresh token with the required Gmail + Calendar scopes.";
     }
     if (lowered.includes("tavily_api_key")) {
-        return "Tip: set TAVILY_API_KEY in your .env to enable web research.";
+        return "Tip: the research provider isn't configured on the server yet.";
     }
     if (lowered.includes("llm_api_key") || lowered.includes("llm is unavailable")) {
-        return "Tip: check your LLM_API_KEY in .env. Free OpenRouter models can also be temporarily rate-limited — try again in a minute.";
+        return "Tip: the LLM provider is temporarily unavailable. Try again in a minute.";
     }
     if (lowered.includes("rate-limited")) {
-        return "Tip: free OpenRouter models are rate-limited. Wait ~60 seconds and retry, or upgrade to a paid model.";
+        return "Tip: the free model is rate-limited. Wait about a minute and retry.";
     }
     return "";
 }
@@ -157,6 +170,21 @@ function sourcesHtml(sources) {
         </div>`).join("")}</div>`;
 }
 
+function feedbackHtml(entry) {
+    const traceId = entry.payload?.response?.meta?.trace_id;
+    if (!traceId) return "";
+    const state = feedbackState[traceId];
+    const upActive = state?.label === "positive" ? " active" : "";
+    const downActive = state?.label === "negative" ? " active" : "";
+    const disabled = state ? " disabled" : "";
+    return `<button type="button" data-act="feedback-up" class="feedback-btn${upActive}" title="Helpful"${disabled}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 10v12"/><path d="M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H7V10l4-9 1.5.5A2 2 0 0 1 14 4.5z"/></svg>
+        </button>
+        <button type="button" data-act="feedback-down" class="feedback-btn${downActive}" title="Not helpful"${disabled}>
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 14V2"/><path d="M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H17v12l-4 9-1.5-.5A2 2 0 0 1 10 19.5z"/></svg>
+        </button>`;
+}
+
 function actionsHtml(entry) {
     const hasSpeech = "speechSynthesis" in window;
     const speakBtn = hasSpeech ? `<button type="button" data-act="speak">
@@ -170,6 +198,7 @@ function actionsHtml(entry) {
         <button type="button" data-act="download">
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             Download</button>
+        ${feedbackHtml(entry)}
     </div>`;
 }
 
@@ -355,7 +384,12 @@ function speakText(text, button) {
 
 // -- API calls -------------------------------------------------------------
 async function fetchJson(url, options = {}) {
-    const res = await fetch(url, options);
+    const merged = { credentials: "same-origin", ...options };
+    const res = await fetch(url, merged);
+    if (res.status === 401) {
+        showLogin();
+        return buildErrorPayload("Sign in required", "Please sign in with Google to continue.");
+    }
     let payload;
     try { payload = await res.json(); }
     catch { payload = buildErrorPayload("Unexpected response", `Status ${res.status}`); }
@@ -606,15 +640,96 @@ messagesEl.addEventListener("click", (e) => {
     const idx = Number(article?.dataset.idx);
     const entry = messages[idx];
     if (!entry) return;
-    const text = exportText(entry);
-    if (btn.dataset.act === "copy") {
+    const act = btn.dataset.act;
+    if (act === "copy") {
+        const text = exportText(entry);
         navigator.clipboard.writeText(text).then(() => setStatus("Copied"));
-    } else if (btn.dataset.act === "download") {
+    } else if (act === "download") {
+        const text = exportText(entry);
         downloadText("autopilot-response.txt", text);
-    } else if (btn.dataset.act === "speak") {
+    } else if (act === "speak") {
+        const text = exportText(entry);
         speakText(text, btn);
+    } else if (act === "feedback-up" || act === "feedback-down") {
+        submitFeedback(entry, act === "feedback-up" ? 1 : 0);
     }
 });
+
+async function submitFeedback(entry, reward) {
+    const traceId = entry.payload?.response?.meta?.trace_id;
+    if (!traceId || feedbackState[traceId]) return;
+    const label = reward >= 0.5 ? "positive" : "negative";
+    feedbackState[traceId] = { reward, label };
+    render();
+    setStatus(reward >= 0.5 ? "Thanks — glad that helped!" : "Thanks — I'll try a different approach next time.");
+    try {
+        await fetchJson("/api/feedback", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ trace_id: traceId, reward, label }),
+        });
+    } catch {
+        /* silently ignore — learning failures shouldn't bother the user */
+    }
+    setTimeout(() => { if (!isWorking) setStatus("Ready"); }, 2200);
+}
+
+// -- Auth & user menu ------------------------------------------------------
+function showLogin() {
+    if (loginScreen) loginScreen.hidden = false;
+    if (appShell) appShell.hidden = true;
+}
+
+function showApp(user) {
+    if (loginScreen) loginScreen.hidden = true;
+    if (appShell) appShell.hidden = false;
+    currentUser = user;
+    if (userNameEl) userNameEl.textContent = user.name || user.email || "—";
+    if (userEmailEl) userEmailEl.textContent = user.email || "—";
+    if (userAvatarLetter) {
+        const letterSource = (user.name || user.email || "?").trim();
+        userAvatarLetter.textContent = (letterSource[0] || "?").toUpperCase();
+    }
+}
+
+async function initAuth() {
+    try {
+        const res = await fetch("/api/me", { credentials: "same-origin" });
+        if (res.ok) {
+            const data = await res.json();
+            if (data.ok && data.user) {
+                showApp(data.user);
+                return true;
+            }
+        }
+    } catch {
+        /* network error — fall through to login */
+    }
+    showLogin();
+    return false;
+}
+
+if (userAvatar && userDropdown) {
+    userAvatar.addEventListener("click", (e) => {
+        e.stopPropagation();
+        userDropdown.hidden = !userDropdown.hidden;
+    });
+    document.addEventListener("click", (e) => {
+        if (!userDropdown.hidden && !userMenu.contains(e.target)) {
+            userDropdown.hidden = true;
+        }
+    });
+}
+
+if (logoutButton) {
+    logoutButton.addEventListener("click", async () => {
+        try {
+            await fetch("/logout", { method: "POST", credentials: "same-origin" });
+        } catch { /* ignore */ }
+        sessionStorage.removeItem(STORAGE_KEY);
+        window.location.reload();
+    });
+}
 
 // -- Bootstrap -------------------------------------------------------------
 applyTheme(localStorage.getItem(THEME_KEY) || "light");
@@ -623,3 +738,4 @@ messages = loadMessages();
 render();
 initVoice();
 autoResize();
+initAuth();

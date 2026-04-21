@@ -1,16 +1,16 @@
+"""Per-user UCB1 bandit over prompt variants, backed by Supabase.
+
+Each user has their own learning policy. Feedback on their responses updates
+only their own bandit state — learning is isolated per-user.
+"""
+
 import json
 import math
-import os
-import threading
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
-DATA_DIR = Path("/tmp") if os.getenv("VERCEL") else Path(__file__).resolve().parent.parent / "data"
-POLICY_PATH = DATA_DIR / "policy_state.json"
-TRACE_LOG_PATH = DATA_DIR / "interaction_traces.jsonl"
-FEEDBACK_LOG_PATH = DATA_DIR / "feedback_events.jsonl"
-AGENT_LIGHTNING_EXPORT_PATH = DATA_DIR / "agent_lightning_events.jsonl"
+from services.supabase_client import get_supabase
+
 
 POLICY_VARIANTS = {
     "intent_routing": ("strict_json", "workflow_json"),
@@ -71,205 +71,200 @@ PROMPT_VARIANTS = {
     },
 }
 
-_LOCK = threading.Lock()
-_AGENT_LIGHTNING_STATUS = None
-
 
 def _timestamp():
     return datetime.now(timezone.utc).isoformat()
-
-
-def _default_policy_state():
-    return {
-        "updated_at": _timestamp(),
-        "skills": {
-            skill: {
-                variant: {"count": 0, "total_reward": 0.0}
-                for variant in variants
-            }
-            for skill, variants in POLICY_VARIANTS.items()
-        },
-    }
-
-
-def _ensure_storage():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if not POLICY_PATH.exists():
-        POLICY_PATH.write_text(json.dumps(_default_policy_state(), indent=2), encoding="utf-8")
-    for path in (TRACE_LOG_PATH, FEEDBACK_LOG_PATH, AGENT_LIGHTNING_EXPORT_PATH):
-        if not path.exists():
-            path.write_text("", encoding="utf-8")
-
-
-def _load_policy_state():
-    _ensure_storage()
-    return json.loads(POLICY_PATH.read_text(encoding="utf-8"))
-
-
-def _save_policy_state(state):
-    state["updated_at"] = _timestamp()
-    POLICY_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
-
-
-def _append_jsonl(path, payload):
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload) + "\n")
 
 
 def get_prompt_variant(skill, strategy):
     return PROMPT_VARIANTS[skill][strategy]
 
 
-def select_strategy(skill):
-    with _LOCK:
-        state = _load_policy_state()
-        skill_state = state["skills"].setdefault(
-            skill,
-            {variant: {"count": 0, "total_reward": 0.0} for variant in POLICY_VARIANTS[skill]},
-        )
+def _load_user_skill_state(user_id, skill):
+    """Return dict variant -> {count, total_reward}, initializing rows on first call."""
+    client = get_supabase()
+    response = (
+        client.table("bandit_state")
+        .select("variant, count, total_reward")
+        .eq("user_id", user_id)
+        .eq("skill", skill)
+        .execute()
+    )
 
-        for variant, stats in skill_state.items():
-            if stats["count"] == 0:
-                return variant
+    by_variant = {row["variant"]: row for row in (response.data or [])}
+    variants = POLICY_VARIANTS.get(skill, ())
 
-        total_count = sum(stats["count"] for stats in skill_state.values())
-        scores = {}
-        for variant, stats in skill_state.items():
-            average_reward = stats["total_reward"] / stats["count"]
-            exploration_bonus = math.sqrt(2 * math.log(total_count) / stats["count"])
-            scores[variant] = average_reward + exploration_bonus
+    missing = [v for v in variants if v not in by_variant]
+    if missing:
+        client.table("bandit_state").insert(
+            [
+                {"user_id": user_id, "skill": skill, "variant": v, "count": 0, "total_reward": 0}
+                for v in missing
+            ]
+        ).execute()
+        for v in missing:
+            by_variant[v] = {"variant": v, "count": 0, "total_reward": 0}
 
-        return max(scores, key=scores.get)
+    return by_variant
 
 
-def _agent_lightning_status():
-    global _AGENT_LIGHTNING_STATUS
-
-    if _AGENT_LIGHTNING_STATUS is not None:
-        return _AGENT_LIGHTNING_STATUS
+def select_strategy(user_id, skill):
+    """UCB1: try each variant once, then pick argmax(avg_reward + sqrt(2 ln N / n))."""
+    variants = POLICY_VARIANTS.get(skill, ())
+    if not variants:
+        return ""
 
     try:
-        import agentlightning  # noqa: F401
+        state = _load_user_skill_state(user_id, skill)
+    except Exception:
+        # DB unavailable — fall back to first variant
+        return variants[0]
 
-        _AGENT_LIGHTNING_STATUS = {"available": True, "mode": "native"}
-    except Exception as exc:
-        _AGENT_LIGHTNING_STATUS = {
-            "available": False,
-            "mode": "compat-export",
-            "reason": str(exc),
-        }
+    for variant in variants:
+        if state.get(variant, {}).get("count", 0) == 0:
+            return variant
 
-    return _AGENT_LIGHTNING_STATUS
+    total_count = sum(state[v].get("count", 0) for v in variants)
+    best_variant = variants[0]
+    best_score = float("-inf")
+    for variant in variants:
+        stats = state[variant]
+        count = stats.get("count", 0) or 1
+        average_reward = (stats.get("total_reward", 0.0) or 0.0) / count
+        exploration_bonus = math.sqrt(2 * math.log(max(total_count, 1)) / count)
+        score = average_reward + exploration_bonus
+        if score > best_score:
+            best_score = score
+            best_variant = variant
+    return best_variant
 
 
-def attach_trace(payload, skill, strategy, request_payload):
+def attach_trace(payload, user_id, skill, strategy, request_payload):
     if not payload.get("ok"):
         return payload
 
-    _ensure_storage()
-    trace_id = uuid.uuid4().hex
-    trace = {
-        "trace_id": trace_id,
-        "timestamp": _timestamp(),
-        "skill": skill,
-        "strategy": strategy,
-        "request": request_payload,
-        "response": payload["response"].get("export_text", payload["response"].get("text", "")),
-    }
+    try:
+        client = get_supabase()
+        trace_id = str(uuid.uuid4())
+        response_text = payload["response"].get("export_text") or payload["response"].get("text") or ""
+        client.table("traces").insert(
+            {
+                "id": trace_id,
+                "user_id": user_id,
+                "skill": skill,
+                "strategy": strategy,
+                "request": request_payload,
+                "response_text": response_text,
+            }
+        ).execute()
 
-    with _LOCK:
-        _append_jsonl(TRACE_LOG_PATH, trace)
+        payload["response"]["meta"]["trace_id"] = trace_id
+        payload["response"]["meta"]["skill"] = skill
+        payload["response"]["meta"]["strategy"] = strategy
+        payload["response"]["meta"]["learning_mode"] = "ucb_bandit_per_user"
+    except Exception:
+        # Trace failure must not break the user's response
+        pass
 
-    payload["response"]["meta"]["trace_id"] = trace_id
-    payload["response"]["meta"]["skill"] = skill
-    payload["response"]["meta"]["strategy"] = strategy
-    payload["response"]["meta"]["learning_mode"] = "ucb_bandit"
-    payload["response"]["meta"]["agent_lightning_mode"] = _agent_lightning_status()["mode"]
     return payload
 
 
-def _find_trace(trace_id):
-    if not TRACE_LOG_PATH.exists():
+def _find_trace(user_id, trace_id):
+    client = get_supabase()
+    response = (
+        client.table("traces")
+        .select("*")
+        .eq("id", trace_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+    if not response.data:
         return None
-
-    with TRACE_LOG_PATH.open("r", encoding="utf-8") as handle:
-        for line in reversed(handle.readlines()):
-            if not line.strip():
-                continue
-            payload = json.loads(line)
-            if payload.get("trace_id") == trace_id:
-                return payload
-
-    return None
+    return response.data[0]
 
 
-def record_feedback(trace_id, reward, label=None, comment=""):
-    reward_value = float(reward)
-    trace = _find_trace(trace_id)
+def record_feedback(user_id, trace_id, reward, label=None, comment=""):
+    if not trace_id:
+        return {"ok": False, "message": "trace_id is required."}
+
+    try:
+        reward_value = float(reward)
+    except (TypeError, ValueError):
+        reward_value = 0.0
+
+    client = get_supabase()
+    trace = _find_trace(user_id, trace_id)
     if trace is None:
-        return {
-            "ok": False,
-            "message": "Trace not found for feedback.",
-        }
+        return {"ok": False, "message": "Trace not found for feedback."}
 
-    with _LOCK:
-        state = _load_policy_state()
-        skill_state = state["skills"][trace["skill"]][trace["strategy"]]
-        skill_state["count"] += 1
-        skill_state["total_reward"] += reward_value
-        average_reward = skill_state["total_reward"] / skill_state["count"]
-        _save_policy_state(state)
+    skill = trace["skill"]
+    strategy = trace["strategy"]
 
-        feedback_event = {
+    # Read current bandit row, then upsert incremented values
+    state = _load_user_skill_state(user_id, skill)
+    stats = state.get(strategy, {"count": 0, "total_reward": 0.0})
+    new_count = (stats.get("count", 0) or 0) + 1
+    new_total = (stats.get("total_reward", 0.0) or 0.0) + reward_value
+
+    client.table("bandit_state").upsert(
+        {
+            "user_id": user_id,
+            "skill": skill,
+            "variant": strategy,
+            "count": new_count,
+            "total_reward": new_total,
+            "updated_at": _timestamp(),
+        },
+        on_conflict="user_id,skill,variant",
+    ).execute()
+
+    client.table("feedback").insert(
+        {
             "trace_id": trace_id,
-            "timestamp": _timestamp(),
-            "skill": trace["skill"],
-            "strategy": trace["strategy"],
+            "user_id": user_id,
             "reward": reward_value,
             "label": label or ("positive" if reward_value >= 0.5 else "negative"),
-            "comment": comment,
+            "comment": comment or "",
         }
-        _append_jsonl(FEEDBACK_LOG_PATH, feedback_event)
-        _append_jsonl(
-            AGENT_LIGHTNING_EXPORT_PATH,
-            {
-                "timestamp": _timestamp(),
-                "trace": trace,
-                "feedback": feedback_event,
-                "agent_lightning": _agent_lightning_status(),
-            },
-        )
+    ).execute()
 
     return {
         "ok": True,
         "message": "Feedback recorded.",
         "trace_id": trace_id,
-        "skill": trace["skill"],
-        "strategy": trace["strategy"],
-        "average_reward": round(average_reward, 4),
-        "count": skill_state["count"],
-        "agent_lightning": _agent_lightning_status(),
+        "skill": skill,
+        "strategy": strategy,
+        "average_reward": round(new_total / new_count, 4) if new_count else 0.0,
+        "count": new_count,
     }
 
 
-def get_learning_status():
-    with _LOCK:
-        state = _load_policy_state()
+def get_learning_status(user_id):
+    client = get_supabase()
+    response = (
+        client.table("bandit_state")
+        .select("skill, variant, count, total_reward, updated_at")
+        .eq("user_id", user_id)
+        .execute()
+    )
 
     summary = {}
-    for skill, variants in state["skills"].items():
-        summary[skill] = {}
-        for variant, stats in variants.items():
-            count = stats["count"]
-            total_reward = stats["total_reward"]
-            summary[skill][variant] = {
-                "count": count,
-                "average_reward": round(total_reward / count, 4) if count else 0.0,
-            }
+    latest_update = None
+    for row in response.data or []:
+        skill = row["skill"]
+        variant = row["variant"]
+        count = row.get("count", 0) or 0
+        total_reward = row.get("total_reward", 0.0) or 0.0
+        summary.setdefault(skill, {})[variant] = {
+            "count": count,
+            "average_reward": round(total_reward / count, 4) if count else 0.0,
+        }
+        if row.get("updated_at") and (not latest_update or row["updated_at"] > latest_update):
+            latest_update = row["updated_at"]
 
     return {
         "ok": True,
-        "updated_at": state["updated_at"],
-        "agent_lightning": _agent_lightning_status(),
+        "updated_at": latest_update or _timestamp(),
         "policy": summary,
     }
