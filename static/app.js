@@ -1,28 +1,55 @@
-const STORAGE_KEY = "autopilot-browser-history";
+const STORAGE_KEY = "autopilot-chat-v2";
 const THEME_KEY = "autopilot-theme";
-const USER_META_LABELS = {
+const AUTOSPEAK_KEY = "autopilot-autospeak";
+
+const META_LABELS = {
     count: "Emails",
     source_count: "Sources",
     filename: "File",
     recipient: "To",
+    reminder_backend: "Saved in",
 };
 
-const messagesNode = document.getElementById("messages");
+const BACKEND_LABELS = {
+    google_calendar: "Google Calendar",
+    gmail_fallback: "Gmail mailbox",
+    local_fallback: "Local file",
+};
+
+const messagesEl = document.getElementById("messages");
 const chatForm = document.getElementById("chat-form");
 const chatInput = document.getElementById("chat-input");
 const statusPill = document.getElementById("status-pill");
 const themeToggle = document.getElementById("theme-toggle");
+const autospeakToggle = document.getElementById("autospeak-toggle");
+const newChatBtn = document.getElementById("new-chat");
 const voiceButton = document.getElementById("voice-button");
-const quickActions = document.querySelectorAll(".quick-action");
-const toolForms = document.querySelectorAll(".tool-form");
+const sendButton = chatForm.querySelector(".send-button");
+const chips = document.querySelectorAll(".chip");
+const modalBackdrop = document.getElementById("modal-backdrop");
+const modalBody = document.getElementById("modal-body");
+const modalTitle = document.getElementById("modal-title");
+const modalClose = document.getElementById("modal-close");
 
 let messages = [];
 let recognition = null;
+let currentUtterance = null;
+let autoSpeak = false;
+let isWorking = false;
 
-function setStatus(text) {
-    statusPill.textContent = text;
+// -- Storage ---------------------------------------------------------------
+function saveMessages() {
+    try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(messages)); }
+    catch { /* quota exceeded – ignore */ }
+}
+function loadMessages() {
+    try {
+        const raw = sessionStorage.getItem(STORAGE_KEY);
+        return raw ? JSON.parse(raw) : [];
+    } catch { return []; }
 }
 
+// -- Utils -----------------------------------------------------------------
 function escapeHtml(value) {
     return String(value ?? "")
         .replace(/&/g, "&amp;")
@@ -31,26 +58,33 @@ function escapeHtml(value) {
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#39;");
 }
-
-function saveMessages() {
-    sessionStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+function linkify(escaped) {
+    return escaped.replace(/(https?:\/\/[^\s<)]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
 }
-
-function loadMessages() {
-    const raw = sessionStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    try { return JSON.parse(raw); }
-    catch { sessionStorage.removeItem(STORAGE_KEY); return []; }
+function renderRich(raw) {
+    return linkify(escapeHtml(raw));
+}
+function setStatus(text) { statusPill.textContent = text; }
+function setWorking(flag) {
+    isWorking = flag;
+    sendButton.disabled = flag;
+    if (flag) setStatus("Thinking...");
 }
 
 function applyTheme(theme) {
     document.documentElement.dataset.theme = theme;
     localStorage.setItem(THEME_KEY, theme);
 }
+function applyAutoSpeak(enabled) {
+    autoSpeak = enabled;
+    autospeakToggle.setAttribute("aria-pressed", enabled ? "true" : "false");
+    localStorage.setItem(AUTOSPEAK_KEY, enabled ? "1" : "0");
+}
 
-function getExportText(entry) {
+function exportText(entry) {
     if (entry.role === "user") return entry.text;
-    return entry.payload?.response?.export_text || entry.payload?.response?.text || "";
+    const r = entry.payload?.response;
+    return r?.export_text || r?.text || "";
 }
 
 function downloadText(filename, text) {
@@ -63,296 +97,529 @@ function downloadText(filename, text) {
     URL.revokeObjectURL(url);
 }
 
-function buildErrorPayload(title, text) {
+function buildErrorPayload(title, text, hint = "") {
+    const full = hint ? `${text}\n\n${hint}` : text;
     return {
         ok: false,
-        response: { title, text, items: [], meta: {}, sources: [], export_text: `${title}\n\n${text}` },
+        response: {
+            title, text: full, items: [], meta: {}, sources: [],
+            export_text: `${title}\n\n${full}`,
+        },
     };
 }
 
-function createMetaChips(meta) {
-    const keys = Object.keys(meta || {}).filter((key) => USER_META_LABELS[key] && meta[key]);
-    if (!keys.length) return "";
-    return `<div class="message-meta">${keys.map((key) => `<span class="meta-chip">${escapeHtml(USER_META_LABELS[key])}: ${escapeHtml(meta[key])}</span>`).join("")}</div>`;
-}
-
-function createItemMarkup(item) {
-    const attachments = item.attachments?.length
-        ? `<div class="attachment-list">${item.attachments.map((a) => `<article class="attachment-card"><h5>${escapeHtml(a.filename)}</h5><p>${escapeHtml(a.summary)}</p></article>`).join("")}</div>`
-        : "";
-    const note = item.note ? `<p class="message-note">${escapeHtml(item.note)}</p>` : "";
-    return `
-        <article class="message-item">
-            ${item.title ? `<h4>${escapeHtml(item.title)}</h4>` : ""}
-            ${item.subtitle ? `<p class="message-note">${escapeHtml(item.subtitle)}</p>` : ""}
-            ${item.body ? `<p>${escapeHtml(item.body)}</p>` : ""}
-            ${note}${attachments}
-        </article>`;
-}
-
-function createSourceMarkup(sources) {
-    if (!sources?.length) return "";
-    return `<div class="source-list">${sources.map((s) => `<article class="source-card"><strong>${escapeHtml(s.title || "Source")}</strong>${s.url ? ` <a href="${escapeHtml(s.url)}" target="_blank" rel="noreferrer">Open</a>` : ""}</article>`).join("")}</div>`;
-}
-
-function renderAssistantMarkup(entry) {
-    const r = entry.payload.response;
-    const items = r.items?.length ? `<div class="message-grid">${r.items.map(createItemMarkup).join("")}</div>` : "";
-    const sources = createSourceMarkup(r.sources);
-    const meta = createMetaChips(r.meta);
-    const traceId = r.meta?.trace_id || "";
-    const feedback = traceId && !entry.feedbackSubmitted
-        ? `<button type="button" data-feedback="1" data-trace-id="${escapeHtml(traceId)}">Helpful</button><button type="button" data-feedback="0" data-trace-id="${escapeHtml(traceId)}">Needs work</button>`
-        : (entry.feedbackSubmitted ? `<span class="meta-chip">Feedback saved</span>` : "");
-    const speak = window.speechSynthesis ? `<button type="button" data-speak="${escapeHtml(getExportText(entry))}">Speak</button>` : "";
-
-    return `
-        <div class="message-header">
-            <div class="message-role">Assistant</div>
-            <h3 class="message-title">${escapeHtml(r.title)}</h3>
-        </div>
-        <p class="message-text">${escapeHtml(r.text)}</p>
-        ${meta}${items}${sources}
-        <div class="message-actions">
-            ${feedback}${speak}
-            <button type="button" data-copy="${escapeHtml(getExportText(entry))}">Copy</button>
-            <button type="button" data-download="${escapeHtml(getExportText(entry))}">Download</button>
-        </div>`;
-}
-
-function renderUserMarkup(entry) {
-    return `<div class="message-role">You</div><p class="message-text">${escapeHtml(entry.text)}</p>`;
-}
-
-function renderMessages() {
-    if (!messages.length) {
-        messagesNode.innerHTML = `<div class="empty-state"><p>No messages yet. Chat or use the tools on the left.</p></div>`;
-        return;
+function friendlyErrorHint(text) {
+    const lowered = (text || "").toLowerCase();
+    if (lowered.includes("invalid_grant") || lowered.includes("missing google credentials")) {
+        return "Tip: regenerate your Google refresh tokens by running `python generate_token.py` (Gmail) or `python generate_calendar_token.py` (Calendar) locally, then paste them into your .env file.";
     }
-    messagesNode.innerHTML = messages.map((e) => `<article class="message ${escapeHtml(e.role)}">${e.role === "assistant" ? renderAssistantMarkup(e) : renderUserMarkup(e)}</article>`).join("");
-    messagesNode.scrollTop = messagesNode.scrollHeight;
+    if (lowered.includes("tavily_api_key")) {
+        return "Tip: set TAVILY_API_KEY in your .env to enable web research.";
+    }
+    if (lowered.includes("llm_api_key") || lowered.includes("llm is unavailable")) {
+        return "Tip: check your LLM_API_KEY in .env. Free OpenRouter models can also be temporarily rate-limited — try again in a minute.";
+    }
+    if (lowered.includes("rate-limited")) {
+        return "Tip: free OpenRouter models are rate-limited. Wait ~60 seconds and retry, or upgrade to a paid model.";
+    }
+    return "";
+}
+
+// -- Rendering -------------------------------------------------------------
+function metaChipsHtml(meta) {
+    if (!meta) return "";
+    const keys = Object.keys(meta).filter((k) => META_LABELS[k] && meta[k]);
+    if (!keys.length) return "";
+    return `<div class="meta-row">${keys.map((k) => {
+        const raw = meta[k];
+        const label = META_LABELS[k];
+        const value = k === "reminder_backend" ? (BACKEND_LABELS[raw] || raw) : raw;
+        return `<span class="meta-chip">${escapeHtml(label)}: ${escapeHtml(value)}</span>`;
+    }).join("")}</div>`;
+}
+
+function itemsHtml(items) {
+    if (!items || !items.length) return "";
+    return `<div class="items">${items.map((it) => `
+        <article class="item-card">
+            ${it.title ? `<h4>${escapeHtml(it.title)}</h4>` : ""}
+            ${it.subtitle ? `<p class="subtitle">${escapeHtml(it.subtitle)}</p>` : ""}
+            ${it.body ? `<p class="body">${renderRich(it.body)}</p>` : ""}
+        </article>`).join("")}</div>`;
+}
+
+function sourcesHtml(sources) {
+    if (!sources || !sources.length) return "";
+    return `<div class="sources">${sources.map((s) => `
+        <div class="source">
+            <span>${escapeHtml(s.title || "Source")}</span>
+            ${s.url ? `<a href="${escapeHtml(s.url)}" target="_blank" rel="noopener noreferrer">Open ↗</a>` : ""}
+        </div>`).join("")}</div>`;
+}
+
+function actionsHtml(entry) {
+    const hasSpeech = "speechSynthesis" in window;
+    const speakBtn = hasSpeech ? `<button type="button" data-act="speak">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+        Speak</button>` : "";
+    return `<div class="actions">
+        ${speakBtn}
+        <button type="button" data-act="copy">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            Copy</button>
+        <button type="button" data-act="download">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Download</button>
+    </div>`;
+}
+
+function assistantRoleLabel(payload) {
+    if (!payload?.ok) return "error";
+    return "assistant";
+}
+
+function renderMessage(entry, idx) {
+    if (entry.role === "user") {
+        return `<article class="message user" data-idx="${idx}">
+            <div class="avatar">You</div>
+            <div class="bubble">
+                <div class="role">You</div>
+                <div class="text">${escapeHtml(entry.text)}</div>
+            </div>
+        </article>`;
+    }
+    if (entry.role === "typing") {
+        return `<article class="message assistant" data-idx="${idx}">
+            <div class="avatar">A</div>
+            <div class="bubble">
+                <div class="role">AutoPilot</div>
+                <div class="typing"><span></span><span></span><span></span></div>
+            </div>
+        </article>`;
+    }
+    const r = entry.payload?.response || {};
+    const roleClass = assistantRoleLabel(entry.payload);
+    const roleLabel = entry.payload?.ok ? "AutoPilot" : "Issue";
+    const isGenericGreeting = r.title === "AutoPilot AI";
+    const title = (r.title && !isGenericGreeting) ? `<div class="title">${escapeHtml(r.title)}</div>` : "";
+    const text = r.text ? `<div class="text">${renderRich(r.text)}</div>` : "";
+    return `<article class="message ${roleClass}" data-idx="${idx}">
+        <div class="avatar">${roleClass === "error" ? "!" : "A"}</div>
+        <div class="bubble">
+            <div class="role">${escapeHtml(roleLabel)}</div>
+            ${title}${text}
+            ${metaChipsHtml(r.meta)}
+            ${itemsHtml(r.items)}
+            ${sourcesHtml(r.sources)}
+            ${actionsHtml(entry)}
+        </div>
+    </article>`;
+}
+
+function renderWelcome() {
+    messagesEl.innerHTML = `<div class="welcome">
+        <div class="welcome-mark">A</div>
+        <h2>How can I help today?</h2>
+        <p>Summarize your inbox, send an email, set a reminder, research any topic, or summarize a document. Tap a chip below, type a request, or hit the mic.</p>
+    </div>`;
+}
+
+function render() {
+    if (!messages.length) { renderWelcome(); return; }
+    messagesEl.innerHTML = messages.map(renderMessage).join("");
+    requestAnimationFrame(() => { messagesEl.scrollTop = messagesEl.scrollHeight; });
 }
 
 function pushMessage(entry) {
     messages.push(entry);
+    if (entry.role !== "typing") saveMessages();
+    render();
+    return messages.length - 1;
+}
+
+function replaceMessage(idx, entry) {
+    messages[idx] = entry;
     saveMessages();
-    renderMessages();
+    render();
 }
 
-async function copyText(text) {
-    await navigator.clipboard.writeText(text);
-    setStatus("Copied");
+function removeMessage(idx) {
+    messages.splice(idx, 1);
+    saveMessages();
+    render();
 }
 
-function speakText(text, button) {
-    if (!window.speechSynthesis || !text) return;
-    if (window.speechSynthesis.speaking) {
-        window.speechSynthesis.cancel();
-        setStatus("Ready");
-        if (button) button.textContent = "Speak";
-        return;
-    }
-    const u = new SpeechSynthesisUtterance(text);
-    u.onstart = () => { setStatus("Speaking..."); if (button) button.textContent = "Stop"; };
-    u.onend = () => { setStatus("Ready"); if (button) button.textContent = "Speak"; };
-    u.onerror = () => { setStatus("Ready"); if (button) button.textContent = "Speak"; };
-    window.speechSynthesis.speak(u);
-}
-
-async function fetchJson(url, options = {}) {
-    return (await fetch(url, options)).json();
-}
-
-async function submitFeedback(traceId, reward) {
-    const payload = await fetchJson("/api/feedback", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ trace_id: traceId, reward, label: reward >= 0.5 ? "positive" : "negative" }),
-    });
-    if (!payload.ok) { setStatus("Feedback failed"); return; }
-    const entry = messages.find((m) => m.payload?.response?.meta?.trace_id === traceId);
-    if (entry) { entry.feedbackSubmitted = true; saveMessages(); renderMessages(); }
-    setStatus("Feedback saved");
-}
-
-async function runCommand(text) {
-    pushMessage({ role: "user", text });
-    setStatus("Working...");
-    try {
-        const payload = await fetchJson("/api/command", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message: text }),
-        });
-        pushMessage({ role: "assistant", payload });
-        setStatus(payload.ok ? "Ready" : "Needs attention");
-    } catch (error) {
-        pushMessage({ role: "assistant", payload: buildErrorPayload("Request failed", error.message) });
-        setStatus("Request failed");
-    }
-}
-
-async function runQuickAction(action) {
-    if (action !== "mail-summary") return;
-    pushMessage({ role: "user", text: "Summarize my latest emails." });
-    setStatus("Working...");
-    try {
-        const payload = await fetchJson("/api/mail/summary");
-        pushMessage({ role: "assistant", payload });
-        setStatus(payload.ok ? "Ready" : "Needs attention");
-    } catch (error) {
-        pushMessage({ role: "assistant", payload: buildErrorPayload("Quick action failed", error.message) });
-        setStatus("Request failed");
-    }
-}
-
-async function submitToolForm(form) {
-    const endpoint = form.dataset.endpoint;
-    const userLabel = form.dataset.userLabel || "Tool request";
-    const isUpload = form.id === "upload-tool-form";
-    const formData = new FormData(form);
-    pushMessage({ role: "user", text: userLabel });
-    setStatus("Working...");
-    try {
-        let payload;
-        if (isUpload) {
-            payload = await fetchJson(endpoint, { method: "POST", body: formData });
-        } else {
-            const body = {};
-            formData.forEach((v, k) => { body[k] = v; });
-            body.polish = formData.get("polish") === "on";
-            payload = await fetchJson(endpoint, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-            });
-        }
-        pushMessage({ role: "assistant", payload });
-        setStatus(payload.ok ? "Ready" : "Needs attention");
-        form.reset();
-    } catch (error) {
-        pushMessage({ role: "assistant", payload: buildErrorPayload("Tool request failed", error.message) });
-        setStatus("Request failed");
-    }
-}
-
-function restoreSession() {
-    messages = loadMessages();
-    if (!messages.length) {
-        pushMessage({
-            role: "assistant",
-            payload: {
-                ok: true,
-                response: {
-                    title: "Welcome",
-                    text: "Hi! I'm AutoPilot AI. Chat with me or use the tools on the left to get started.",
-                    items: [], meta: {}, sources: [],
-                    export_text: "Welcome\n\nHi! I'm AutoPilot AI. Chat with me or use the tools on the left to get started.",
-                },
-            },
-        });
-        return;
-    }
-    renderMessages();
-}
-
-function initVoiceInput() {
+// -- Voice -----------------------------------------------------------------
+function initVoice() {
     const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!Recognition) { voiceButton.disabled = true; return; }
+    if (!Recognition) { voiceButton.disabled = true; voiceButton.title = "Voice not supported in this browser"; return; }
 
     recognition = new Recognition();
     recognition.lang = "en-US";
     recognition.interimResults = true;
-    recognition.continuous = false;
+    recognition.continuous = true;
+    recognition.maxAlternatives = 1;
+
+    let finalText = "";
+    let isListening = false;
+    let userStopped = false;
+
+    const startListening = () => {
+        finalText = "";
+        userStopped = false;
+        try {
+            recognition.start();
+        } catch { /* already started */ }
+    };
+
+    const stopListening = () => {
+        userStopped = true;
+        try { recognition.stop(); } catch { /* already stopped */ }
+    };
 
     recognition.addEventListener("start", () => {
-        setStatus("Listening...");
+        isListening = true;
+        setStatus("Listening... click mic to stop");
         voiceButton.classList.add("recording");
+        voiceButton.title = "Click to stop recording";
     });
 
     recognition.addEventListener("result", (event) => {
-        let finalTranscript = "";
-        let interimTranscript = "";
-        for (let i = 0; i < event.results.length; i++) {
-            if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript;
-            else interimTranscript += event.results[i][0].transcript;
+        let interim = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+            const res = event.results[i];
+            if (res.isFinal) finalText += res[0].transcript + " ";
+            else interim += res[0].transcript;
         }
-        chatInput.value = finalTranscript || interimTranscript;
-        if (finalTranscript) {
-            setStatus("Voice captured");
-            setTimeout(() => {
-                chatInput.value = finalTranscript.trim();
-                runCommand(finalTranscript.trim());
-                chatInput.value = "";
-            }, 300);
+        const combined = (finalText + interim).trim();
+        if (combined) {
+            chatInput.value = combined;
+            autoResize();
         }
     });
 
     recognition.addEventListener("end", () => {
+        isListening = false;
         voiceButton.classList.remove("recording");
-        if (statusPill.textContent === "Listening...") setStatus("Ready");
+        voiceButton.title = "Click to speak";
+        const text = (finalText || chatInput.value).trim();
+        if (userStopped && text) {
+            chatInput.value = "";
+            autoResize();
+            runCommand(text);
+        } else if (!userStopped && text) {
+            setStatus("Paused — click mic again to keep recording, or press Enter to send");
+        } else {
+            setStatus("Ready");
+        }
     });
 
     recognition.addEventListener("error", (event) => {
+        isListening = false;
         voiceButton.classList.remove("recording");
-        if (event.error === "not-allowed") setStatus("Mic access denied");
-        else if (event.error === "no-speech") setStatus("No speech detected");
-        else setStatus("Voice failed");
+        voiceButton.title = "Click to speak";
+        if (event.error === "not-allowed" || event.error === "service-not-allowed") setStatus("Mic access denied");
+        else if (event.error === "no-speech") setStatus("No speech detected — click mic and try again");
+        else if (event.error === "aborted") setStatus("Ready");
+        else if (event.error === "network") setStatus("Voice needs an internet connection");
+        else setStatus("Voice error: " + event.error);
     });
 
     voiceButton.addEventListener("click", () => {
-        if (voiceButton.classList.contains("recording")) { recognition.stop(); return; }
-        chatInput.value = "";
-        recognition.start();
+        if (isListening) stopListening();
+        else startListening();
     });
 }
 
-// Event listeners
+function cancelSpeaking(button) {
+    if (!window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    if (currentUtterance?.button) currentUtterance.button.classList.remove("speaking");
+    currentUtterance = null;
+    if (button) button.classList.remove("speaking");
+    setStatus("Ready");
+}
+
+function speakText(text, button) {
+    if (!window.speechSynthesis || !text) return;
+    if (window.speechSynthesis.speaking) { cancelSpeaking(button); return; }
+    const u = new SpeechSynthesisUtterance(text);
+    u.rate = 1.02;
+    u.pitch = 1;
+    u.onstart = () => { setStatus("Speaking..."); if (button) button.classList.add("speaking"); };
+    u.onend = () => { setStatus("Ready"); if (button) button.classList.remove("speaking"); currentUtterance = null; };
+    u.onerror = () => { setStatus("Ready"); if (button) button.classList.remove("speaking"); currentUtterance = null; };
+    currentUtterance = { utterance: u, button };
+    window.speechSynthesis.speak(u);
+}
+
+// -- API calls -------------------------------------------------------------
+async function fetchJson(url, options = {}) {
+    const res = await fetch(url, options);
+    let payload;
+    try { payload = await res.json(); }
+    catch { payload = buildErrorPayload("Unexpected response", `Status ${res.status}`); }
+    return payload;
+}
+
+function pushTyping() { return pushMessage({ role: "typing" }); }
+
+function finalizeAssistant(typingIdx, payload, { userShownAt = null } = {}) {
+    const entry = { role: "assistant", payload };
+    replaceMessage(typingIdx, entry);
+    setStatus(payload.ok ? "Ready" : "Needs attention");
+    if (autoSpeak && payload.ok) {
+        const text = payload.response?.text || "";
+        if (text) speakText(text.slice(0, 800));
+    }
+    return entry;
+}
+
+function buildContextTurns() {
+    const turns = [];
+    for (const msg of messages) {
+        if (msg.role === "user" && typeof msg.text === "string" && msg.text.trim()) {
+            turns.push({ role: "user", text: msg.text.trim() });
+        } else if (msg.role === "assistant" && msg.payload?.response) {
+            const r = msg.payload.response;
+            const snippet = (r.text || r.title || "").toString().trim();
+            if (snippet) turns.push({ role: "assistant", text: snippet });
+        }
+    }
+    return turns.slice(-4);
+}
+
+async function runCommand(text) {
+    if (!text || isWorking) return;
+    const contextTurns = buildContextTurns();
+    pushMessage({ role: "user", text });
+    const typingIdx = pushTyping();
+    setWorking(true);
+    try {
+        const payload = await fetchJson("/api/command", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ message: text, context: contextTurns }),
+        });
+        if (!payload.ok) {
+            const hint = friendlyErrorHint(payload.response?.text);
+            if (hint) payload.response.text = `${payload.response.text}\n\n${hint}`;
+        }
+        finalizeAssistant(typingIdx, payload);
+    } catch (err) {
+        replaceMessage(typingIdx, { role: "assistant", payload: buildErrorPayload("Request failed", err.message) });
+        setStatus("Request failed");
+    } finally {
+        setWorking(false);
+    }
+}
+
+async function runFeature(feature, body) {
+    const userLabel = featureLabel(feature);
+    pushMessage({ role: "user", text: userLabel });
+    const typingIdx = pushTyping();
+    setWorking(true);
+    try {
+        let payload;
+        if (feature === "inbox") {
+            payload = await fetchJson("/api/mail/summary");
+        } else if (feature === "email") {
+            payload = await fetchJson("/api/email/send", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+        } else if (feature === "reminder") {
+            payload = await fetchJson("/api/reminder/create", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+        } else if (feature === "research") {
+            payload = await fetchJson("/api/research", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+        } else if (feature === "document") {
+            payload = await fetchJson("/api/attachment/summarize", {
+                method: "POST",
+                body: body, // FormData
+            });
+        }
+        if (!payload.ok) {
+            const hint = friendlyErrorHint(payload.response?.text);
+            if (hint) payload.response.text = `${payload.response.text}\n\n${hint}`;
+        }
+        finalizeAssistant(typingIdx, payload);
+    } catch (err) {
+        replaceMessage(typingIdx, { role: "assistant", payload: buildErrorPayload("Request failed", err.message) });
+        setStatus("Request failed");
+    } finally {
+        setWorking(false);
+    }
+}
+
+function featureLabel(feature) {
+    switch (feature) {
+        case "inbox": return "Summarize my inbox";
+        case "email": return "Send an email";
+        case "reminder": return "Set a reminder";
+        case "research": return "Research a topic";
+        case "document": return "Summarize a document";
+        default: return "Run tool";
+    }
+}
+
+// -- Modal / feature forms -------------------------------------------------
+function openModal(title, innerHtml) {
+    modalTitle.textContent = title;
+    modalBody.innerHTML = innerHtml;
+    modalBackdrop.hidden = false;
+    const firstInput = modalBody.querySelector("input, textarea");
+    if (firstInput) setTimeout(() => firstInput.focus(), 50);
+}
+function closeModal() {
+    modalBackdrop.hidden = true;
+    modalBody.innerHTML = "";
+}
+
+const FEATURE_FORMS = {
+    email: () => `
+        <label>Recipient <input type="email" name="recipient" placeholder="name@example.com" required></label>
+        <label>Subject <input type="text" name="subject" placeholder="Project update"></label>
+        <label>Message <textarea name="message" placeholder="Leave blank to auto-draft."></textarea></label>
+        <label class="checkbox-row"><input type="checkbox" name="polish" checked> Polish with AI</label>
+        <div class="modal-actions">
+            <button type="button" class="btn-secondary" data-close>Cancel</button>
+            <button type="submit" class="btn-primary">Send</button>
+        </div>`,
+    reminder: () => `
+        <label>Title <input type="text" name="title" placeholder="Team sync" required></label>
+        <label>When <input type="text" name="when" placeholder="tomorrow 6pm" required></label>
+        <label>Description <textarea name="description" placeholder="Optional details"></textarea></label>
+        <label>Duration (minutes) <input type="number" name="duration_minutes" min="15" max="720" value="60"></label>
+        <div class="modal-actions">
+            <button type="button" class="btn-secondary" data-close>Cancel</button>
+            <button type="submit" class="btn-primary">Create</button>
+        </div>`,
+    research: () => `
+        <label>Topic <input type="text" name="topic" placeholder="AI workflow automation" required></label>
+        <div class="modal-actions">
+            <button type="button" class="btn-secondary" data-close>Cancel</button>
+            <button type="submit" class="btn-primary">Research</button>
+        </div>`,
+    document: () => `
+        <label>File <input type="file" name="file" accept=".pdf,.docx,.csv,.txt,.md,.json,.html,.css,.js" required></label>
+        <div class="modal-actions">
+            <button type="button" class="btn-secondary" data-close>Cancel</button>
+            <button type="submit" class="btn-primary">Summarize</button>
+        </div>`,
+};
+
+const FEATURE_TITLES = {
+    email: "Send email",
+    reminder: "Set reminder",
+    research: "Research topic",
+    document: "Summarize document",
+};
+
+function handleFeatureClick(feature) {
+    if (feature === "inbox") { runFeature("inbox"); return; }
+    const formBuilder = FEATURE_FORMS[feature];
+    if (!formBuilder) return;
+    openModal(FEATURE_TITLES[feature], `<form id="feature-form" data-feature="${feature}">${formBuilder()}</form>`);
+    const form = modalBody.querySelector("#feature-form");
+    form.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        let body;
+        if (feature === "document") {
+            body = new FormData(form);
+        } else {
+            const data = new FormData(form);
+            body = {};
+            data.forEach((v, k) => { body[k] = v; });
+            if (feature === "email") body.polish = data.get("polish") === "on";
+            if (feature === "reminder") body.duration_minutes = parseInt(body.duration_minutes || "60", 10);
+        }
+        closeModal();
+        await runFeature(feature, body);
+    });
+}
+
+// -- Composer resize -------------------------------------------------------
+function autoResize() {
+    chatInput.style.height = "auto";
+    chatInput.style.height = Math.min(chatInput.scrollHeight, 200) + "px";
+}
+
+// -- Event listeners -------------------------------------------------------
 themeToggle.addEventListener("click", () => {
     applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
 });
 
-chatForm.addEventListener("submit", async (event) => {
-    event.preventDefault();
+autospeakToggle.addEventListener("click", () => applyAutoSpeak(!autoSpeak));
+
+newChatBtn.addEventListener("click", () => {
+    if (!messages.length) return;
+    if (!confirm("Clear the current conversation?")) return;
+    messages = [];
+    saveMessages();
+    cancelSpeaking();
+    render();
+    setStatus("Ready");
+});
+
+chatForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
     const text = chatInput.value.trim();
     if (!text) return;
     chatInput.value = "";
+    autoResize();
     await runCommand(text);
 });
 
-quickActions.forEach((btn) => {
-    btn.addEventListener("click", () => {
-        const openFormId = btn.dataset.openForm;
-        if (openFormId) {
-            const panel = document.getElementById(openFormId);
-            if (panel) { panel.open = true; panel.scrollIntoView({ behavior: "smooth", block: "center" }); }
-            return;
-        }
-        runQuickAction(btn.dataset.action);
-    });
+chatInput.addEventListener("input", autoResize);
+chatInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        chatForm.requestSubmit();
+    }
 });
 
-toolForms.forEach((form) => {
-    form.addEventListener("submit", async (event) => {
-        event.preventDefault();
-        await submitToolForm(form);
-    });
+chips.forEach((btn) => {
+    btn.addEventListener("click", () => handleFeatureClick(btn.dataset.feature));
 });
 
-messagesNode.addEventListener("click", async (event) => {
-    const copyTarget = event.target.closest("[data-copy]");
-    if (copyTarget) { await copyText(copyTarget.dataset.copy); return; }
-
-    const feedbackTarget = event.target.closest("[data-feedback]");
-    if (feedbackTarget) { await submitFeedback(feedbackTarget.dataset.traceId, Number.parseFloat(feedbackTarget.dataset.feedback)); return; }
-
-    const speakTarget = event.target.closest("[data-speak]");
-    if (speakTarget) { speakText(speakTarget.dataset.speak, speakTarget); return; }
-
-    const downloadTarget = event.target.closest("[data-download]");
-    if (downloadTarget) { downloadText("autopilot-response.txt", downloadTarget.dataset.download); }
+modalClose.addEventListener("click", closeModal);
+modalBackdrop.addEventListener("click", (e) => {
+    if (e.target === modalBackdrop || e.target.dataset.close !== undefined) closeModal();
+});
+document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !modalBackdrop.hidden) closeModal();
 });
 
+messagesEl.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-act]");
+    if (!btn) return;
+    const article = btn.closest(".message");
+    const idx = Number(article?.dataset.idx);
+    const entry = messages[idx];
+    if (!entry) return;
+    const text = exportText(entry);
+    if (btn.dataset.act === "copy") {
+        navigator.clipboard.writeText(text).then(() => setStatus("Copied"));
+    } else if (btn.dataset.act === "download") {
+        downloadText("autopilot-response.txt", text);
+    } else if (btn.dataset.act === "speak") {
+        speakText(text, btn);
+    }
+});
+
+// -- Bootstrap -------------------------------------------------------------
 applyTheme(localStorage.getItem(THEME_KEY) || "light");
-restoreSession();
-initVoiceInput();
+applyAutoSpeak(localStorage.getItem(AUTOSPEAK_KEY) === "1");
+messages = loadMessages();
+render();
+initVoice();
+autoResize();

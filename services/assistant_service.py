@@ -41,7 +41,8 @@ MAX_SUMMARY_CHARS = 4000
 MAX_RESEARCH_CHARS = 12000
 MAX_EMAIL_BODY_CHARS = 1800
 MAX_DOCUMENT_BODY_CHARS = 2200
-LOCAL_REMINDER_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "local_reminders.jsonl"
+_DATA_ROOT = Path("/tmp") if os.getenv("VERCEL") else Path(__file__).resolve().parent.parent / "data"
+LOCAL_REMINDER_LOG_PATH = _DATA_ROOT / "local_reminders.jsonl"
 
 EMAIL_BOILERPLATE_MARKERS = (
     "unsubscribe",
@@ -616,6 +617,27 @@ def _store_local_reminder(title, when_iso, description, duration_minutes, error_
     return payload
 
 
+def _derive_name_from_email(email_addr):
+    if not email_addr:
+        return ""
+    local = email_addr.split("@", 1)[0]
+    if not local:
+        return ""
+    local = re.sub(r"\d+", "", local)
+    parts = re.split(r"[._+-]+", local)
+    cleaned_parts = [part for part in parts if part]
+    if not cleaned_parts:
+        return ""
+    if len(cleaned_parts) == 1:
+        chunk = cleaned_parts[0]
+        split = re.findall(r"[A-Z][a-z]+|[a-z]+", chunk)
+        if len(split) >= 2:
+            cleaned_parts = split
+        else:
+            return chunk.capitalize()
+    return " ".join(part.capitalize() for part in cleaned_parts)
+
+
 def _infer_email_subject(subject, message):
     cleaned_subject = (subject or "").strip()
     if cleaned_subject:
@@ -777,17 +799,30 @@ def send_email_message(recipient, subject, message, polish=True):
         service = _get_gmail_service(GMAIL_SEND_SCOPE)
         draft_message = message or _default_email_draft(subject)
         final_subject = _infer_email_subject(subject, draft_message)
-        final_body = (
-            polish_message(
-                draft_message,
-                subject=final_subject,
-                instruction=get_prompt_variant("email_polish", strategy),
-            )
-            if polish
-            else draft_message
-        )
+        sender_name = os.getenv("SENDER_NAME") or _derive_name_from_email(os.getenv("GMAIL_USER", ""))
+        recipient_name = _derive_name_from_email(recipient)
+        polish_skipped_reason = ""
+        if polish:
+            try:
+                final_body = polish_message(
+                    draft_message,
+                    subject=final_subject,
+                    instruction=get_prompt_variant("email_polish", strategy),
+                    sender_name=sender_name,
+                    recipient_email=recipient,
+                    recipient_name_hint=recipient_name,
+                )
+            except Exception as polish_exc:
+                final_body = draft_message
+                polish_skipped_reason = str(polish_exc)
+        else:
+            final_body = draft_message
         gmail_message = _build_gmail_message(recipient, final_subject, final_body)
         service.users().messages().send(userId="me", body=gmail_message).execute()
+
+        status_note = ""
+        if polish_skipped_reason:
+            status_note = f" Note: AI polishing was skipped ({polish_skipped_reason}) — original draft was sent."
 
         export_text = "\n".join(
             [
@@ -803,7 +838,7 @@ def send_email_message(recipient, subject, message, polish=True):
             _success(
                 "email_send",
                 "Email sent",
-                f"Delivered to {recipient}.",
+                f"Delivered to {recipient}.{status_note}",
                 items=[
                     {
                         "title": final_subject,
@@ -811,12 +846,15 @@ def send_email_message(recipient, subject, message, polish=True):
                         "body": final_body,
                     }
                 ],
-                meta={"recipient": recipient},
+                meta={
+                    "recipient": recipient,
+                    "polish_skipped": bool(polish_skipped_reason),
+                },
                 export_text=export_text,
             ),
             "email_polish",
             strategy,
-            {"recipient": recipient, "subject": final_subject, "polish": polish},
+            {"recipient": recipient, "subject": final_subject, "polish": polish and not polish_skipped_reason},
         )
     except Exception as exc:
         return _error(str(exc), title="Could not send email")
@@ -1099,19 +1137,20 @@ def _general_chat(message):
         return _error(str(exc), title="Could not respond")
 
 
-def handle_command(message):
+def handle_command(message, context=None):
     message = (message or "").strip()
     if not message:
         return _error("Type a request before sending it.", title="Empty message")
 
-    if GREETING_PATTERNS.match(message):
+    has_context = bool(context)
+    if GREETING_PATTERNS.match(message) and not has_context:
         response = _general_chat(message)
         response["response"]["meta"]["intent"] = "greeting"
         response["response"]["meta"]["routing_strategy"] = "direct"
         return response
 
     routing_strategy = select_strategy("intent_routing")
-    parsed = parse_intent_with_llm(message, strategy=routing_strategy)
+    parsed = parse_intent_with_llm(message, strategy=routing_strategy, context=context)
     intent = parsed.get("intent", "unknown")
 
     if intent == "summarize_mails":

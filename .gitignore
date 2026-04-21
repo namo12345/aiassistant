@@ -6,3 +6,8 @@ data/*.jsonl
 token.json
 credentials.json
 .playwright-mcp/
+.vercel/
+.claude/
+server.log
+smoke_*.txt
+ui-*.png

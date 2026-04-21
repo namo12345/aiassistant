@@ -1,11 +1,12 @@
 import json
 import math
+import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+DATA_DIR = Path("/tmp") if os.getenv("VERCEL") else Path(__file__).resolve().parent.parent / "data"
 POLICY_PATH = DATA_DIR / "policy_state.json"
 TRACE_LOG_PATH = DATA_DIR / "interaction_traces.jsonl"
 FEEDBACK_LOG_PATH = DATA_DIR / "feedback_events.jsonl"

@@ -8,50 +8,57 @@ from utils.intent_parser import parse_intent
 
 PROMPT_VARIANTS = {
     "strict_json": """
-You are an intent parser for a productivity assistant.
-Return only one JSON object and no extra text.
+You are the intent router for a productivity assistant with 5 real tools.
+Return ONLY a JSON object. No markdown, no prose, no explanation.
 
-Supported intents:
-- summarize_mails
-- summarize_attachments
-- set_reminder
-- send_email
-- do_research
-- research
-- get_weather
-- general_chat
-- unknown
+Intents:
+- summarize_mails     -> the user wants their Gmail inbox summarized.
+- send_email          -> the user wants to send an email. Extract: email, subject (optional), message.
+- set_reminder        -> the user wants a calendar reminder. Extract: task, time, description (optional).
+- do_research         -> ANY question that needs external/world knowledge to answer well:
+                         facts, people, places, concepts, news, career advice, how-to, suggestions,
+                         comparisons, current trends, recommendations, explanations. Extract: topic.
+- summarize_attachments -> the user mentions a file/PDF/doc/attachment they want summarized.
+- general_chat        -> pure social chat: greetings, thanks, small talk, acknowledgements,
+                         meta-questions about the assistant itself ("who are you?", "what can you do?").
 
-Rules:
-- For send_email include "email", optional "subject", and "message".
-- For set_reminder include "task", "time", and optional "description".
-- For research include "topic".
-- If the user mentions files, PDFs, attachments, or documents, use summarize_attachments.
-- If the user is making casual conversation, asking general questions, or greeting, use general_chat.
-- If the request does not match a supported tool, use general_chat (not unknown).
+When in doubt between do_research and general_chat, prefer do_research — answering from memory
+is worse than fetching real sources. Short confirmations like "yes", "sure", "go ahead" should
+reuse the topic/action from the prior assistant message if one is shown in context.
+
+For do_research, the "topic" should be a concise search query (3-10 words), stripped of filler
+like "please tell me", "I want to know", "can you". Examples:
+- "I want to know about cats please tell me" -> topic: "cats"
+- "what is RAG" -> topic: "retrieval augmented generation"
+- "I want to land a job as an AI engineer, where should I start" -> topic: "how to become an AI engineer roadmap"
+- "suggest me some good books on machine learning" -> topic: "best machine learning books"
+- "recent AI trends" -> topic: "latest AI trends 2026"
+
+Context handling: if a "Previous assistant message" is provided and the current user message
+is a short confirmation ("yes", "sure", "please do", "go ahead"), infer the intent and topic
+from what the assistant proposed. Do NOT answer with general_chat in that case.
+
+Output shape:
+{"intent": "<one of the above>", ...extracted fields}
 """,
     "workflow_json": """
-You route browser productivity tasks for a single-user assistant.
-Return only one JSON object and no extra text.
+Route the user's message to one of these tools for a browser productivity assistant.
+Return ONLY one JSON object.
 
-Supported intents:
-- summarize_mails
-- summarize_attachments
-- set_reminder
-- send_email
-- do_research
-- research
-- get_weather
-- general_chat
-- unknown
+Tools:
+- summarize_mails: inbox summary.
+- send_email: send an email (fields: email, subject, message).
+- set_reminder: create a calendar reminder (fields: task, time, description).
+- do_research: anything requiring external knowledge — facts, advice, how-to, news, trends,
+               people, concepts, recommendations, comparisons (field: topic, a concise search query).
+- summarize_attachments: user referenced a file/doc/PDF to summarize.
+- general_chat: greetings, thanks, or meta questions about the assistant itself.
 
-Rules:
-- Extract email, subject, and message for send_email if possible.
-- Extract task, time, and optional description for reminders.
-- Extract a research topic for research requests.
-- Use summarize_attachments for files, PDFs, docs, attachments, and uploads.
-- If the user is chatting casually, greeting, or asking general questions, use general_chat.
-- If the request is ambiguous, prefer the most likely productivity action instead of explaining it.
+Bias: when the user asks ANY factual or advice question, prefer do_research. Only use
+general_chat for pure social/conversational messages.
+
+For short acknowledgements ("yes", "please do", "go ahead") when a Previous assistant message
+is provided, inherit the action the assistant proposed (usually do_research with the implied topic).
 """,
 }
 
@@ -175,17 +182,45 @@ def _extract_json_block(content):
     return json.loads(match.group(0))
 
 
-def parse_intent_with_llm(user_input, strategy="strict_json"):
+def parse_intent_with_llm(user_input, strategy="strict_json", context=None):
     if not user_input or not user_input.strip():
         return {}
 
+    context_block = _format_context(context)
+    user_message = user_input.strip()
+    if context_block:
+        llm_user_prompt = f"{context_block}\n\nCurrent user message: {user_message}"
+    else:
+        llm_user_prompt = user_message
+
     try:
-        content = chat_completion(PROMPT_VARIANTS.get(strategy, PROMPT_VARIANTS["strict_json"]), user_input)
+        content = chat_completion(
+            PROMPT_VARIANTS.get(strategy, PROMPT_VARIANTS["strict_json"]),
+            llm_user_prompt,
+        )
         parsed = _extract_json_block(content)
     except Exception:
         parsed = _fallback_parse(user_input)
 
     return _normalize_result(user_input, parsed)
+
+
+def _format_context(context):
+    if not context:
+        return ""
+    turns = []
+    for entry in context[-4:]:
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get("role") or ""
+        text = (entry.get("text") or entry.get("content") or "").strip()
+        if not text:
+            continue
+        label = "Assistant" if role == "assistant" else "User"
+        turns.append(f"{label}: {text[:400]}")
+    if not turns:
+        return ""
+    return "Recent conversation (most recent last):\n" + "\n".join(turns)
 
 
 def _normalize_result(user_input, parsed):
@@ -222,19 +257,7 @@ def _normalize_result(user_input, parsed):
 
 
 def _has_research_signal(lowered):
-    return any(
-        signal in lowered
-        for signal in (
-            "research",
-            "deep research",
-            "tell me about",
-            "what is",
-            "who is",
-            "explain",
-            "learn about",
-            "find information",
-        )
-    )
+    return bool(lowered and lowered.strip())
 
 
 def _extract_reminder_fields(user_input):

@@ -97,7 +97,12 @@ def attachment_summarize():
 @app.post("/api/command")
 def command():
     payload = request.get_json(silent=True) or {}
-    return _payload_response(handle_command(payload.get("message", "")))
+    return _payload_response(
+        handle_command(
+            payload.get("message", ""),
+            context=payload.get("context") or [],
+        )
+    )
 
 
 @app.post("/api/feedback")
