@@ -15,6 +15,9 @@ Intents:
 - summarize_mails     -> the user wants their Gmail inbox summarized.
 - send_email          -> the user wants to send an email. Extract: email, subject (optional), message.
 - set_reminder        -> the user wants a calendar reminder. Extract: task, time, description (optional).
+- list_events         -> the user wants to see upcoming events / their schedule / what's planned.
+                         Examples: "what's on my schedule", "what's happening tomorrow",
+                         "my calendar this week", "any events coming up". Optional: days_ahead (int).
 - do_research         -> ANY question that needs external/world knowledge to answer well:
                          facts, people, places, concepts, news, career advice, how-to, suggestions,
                          comparisons, current trends, recommendations, explanations. Extract: topic.
@@ -49,6 +52,7 @@ Tools:
 - summarize_mails: inbox summary.
 - send_email: send an email (fields: email, subject, message).
 - set_reminder: create a calendar reminder (fields: task, time, description).
+- list_events: show upcoming calendar events / what's on the user's schedule (optional field: days_ahead).
 - do_research: anything requiring external knowledge — facts, advice, how-to, news, trends,
                people, concepts, recommendations, comparisons (field: topic, a concise search query).
 - summarize_attachments: user referenced a file/doc/PDF to summarize.

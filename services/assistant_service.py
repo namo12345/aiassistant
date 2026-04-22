@@ -23,6 +23,7 @@ from googleapiclient.discovery import build
 
 from services.reinforcement_service import attach_trace, get_prompt_variant, select_strategy
 from services.supabase_client import get_supabase
+from services.user_service import get_user_memory, merge_contact_hint
 from utils.deep_research_agent import search_web
 from utils.llm_util import chat_completion, polish_message, summarize_text
 from utils.nlu_agent import parse_intent_with_llm
@@ -36,7 +37,7 @@ GREETING_PATTERNS = re.compile(
 
 GMAIL_READONLY_SCOPE = ["https://www.googleapis.com/auth/gmail.readonly"]
 GMAIL_SEND_SCOPE = ["https://www.googleapis.com/auth/gmail.send"]
-CALENDAR_SCOPE = ["https://www.googleapis.com/auth/calendar.events"]
+CALENDAR_SCOPE = ["https://www.googleapis.com/auth/calendar"]
 
 MAX_SUMMARY_CHARS = 12000
 MAX_RESEARCH_CHARS = 12000
@@ -691,6 +692,31 @@ def _infer_email_subject(subject, message):
     return "Message from AutoPilot AI"
 
 
+def _extract_sign_off(email_body):
+    """Pull the sign-off phrase from a polished email ('Best regards,', 'Cheers,' etc.)."""
+    if not email_body:
+        return ""
+    lines = [line.strip() for line in email_body.strip().splitlines() if line.strip()]
+    known_sign_offs = (
+        "best regards", "kind regards", "warm regards", "regards", "cheers",
+        "thanks", "thank you", "sincerely", "best", "yours truly", "take care",
+        "talk soon", "all the best", "warmly",
+    )
+    # Check the last ~4 lines for a known sign-off phrase.
+    for line in lines[-5:]:
+        lowered = line.lower().rstrip(",. ")
+        if lowered in known_sign_offs:
+            return line.rstrip(",. ")
+    return ""
+
+
+def _infer_contact_tone(contact_memory, strategy):
+    """Fallback tone for the polish LLM: stored memory > current bandit variant."""
+    if contact_memory and contact_memory.get("tone"):
+        return contact_memory["tone"]
+    return "professional" if strategy == "professional" else "friendly"
+
+
 def _default_email_draft(subject):
     lowered = (subject or "").lower()
     if re.search(r"\b(meeting|meet|schedule|call)\b", lowered):
@@ -842,6 +868,16 @@ def send_email_message(user, recipient, subject, message, polish=True):
         final_subject = _infer_email_subject(subject, draft_message)
         sender_name = (user.get("name") or "").strip() or _derive_name_from_email(user.get("email", ""))
         recipient_name = _derive_name_from_email(recipient)
+
+        # Load this user's memory for this specific contact (adaptive personalization).
+        contact_memory = None
+        try:
+            memory = get_user_memory(user_id) or {}
+            contacts = memory.get("contacts") or {}
+            contact_memory = contacts.get(recipient) or contacts.get(recipient.lower()) or None
+        except Exception:
+            contact_memory = None
+
         polish_skipped_reason = ""
         if polish:
             try:
@@ -852,6 +888,7 @@ def send_email_message(user, recipient, subject, message, polish=True):
                     sender_name=sender_name,
                     recipient_email=recipient,
                     recipient_name_hint=recipient_name,
+                    contact_memory=contact_memory,
                 )
             except Exception as polish_exc:
                 final_body = draft_message
@@ -860,6 +897,19 @@ def send_email_message(user, recipient, subject, message, polish=True):
             final_body = draft_message
         gmail_message = _build_gmail_message(recipient, final_subject, final_body)
         service.users().messages().send(userId="me", body=gmail_message).execute()
+
+        # Learn from this successful send: remember the tone variant we used and the sign-off.
+        try:
+            learned_sign_off = _extract_sign_off(final_body)
+            learned_tone = "professional" if strategy == "professional" else "friendly"
+            merge_contact_hint(
+                user_id,
+                recipient.lower(),
+                tone=learned_tone,
+                sign_off=learned_sign_off or None,
+            )
+        except Exception:
+            pass  # memory persistence must never break the send
 
         status_note = ""
         if polish_skipped_reason:
@@ -1074,6 +1124,100 @@ def set_reminder(user, title, when_text, description="", duration_minutes=60):
         return _error(str(exc), title="Could not create reminder")
 
 
+def list_upcoming_events(user, days_ahead=7, max_results=10):
+    """List the user's upcoming Google Calendar events for the next N days."""
+    try:
+        days_ahead = max(1, min(int(days_ahead or 7), 30))
+        max_results = max(1, min(int(max_results or 10), 25))
+    except (TypeError, ValueError):
+        days_ahead = 7
+        max_results = 10
+
+    try:
+        service = _get_calendar_service(user)
+        from datetime import datetime as _dt, timezone as _tz
+        now_utc = _dt.now(_tz.utc)
+        time_min = now_utc.isoformat()
+        time_max = (now_utc + timedelta(days=days_ahead)).isoformat()
+
+        events_response = (
+            service.events()
+            .list(
+                calendarId="primary",
+                timeMin=time_min,
+                timeMax=time_max,
+                maxResults=max_results,
+                singleEvents=True,
+                orderBy="startTime",
+            )
+            .execute()
+        )
+        events = events_response.get("items", [])
+    except Exception as exc:
+        if _is_calendar_auth_error(exc):
+            return _error(
+                "Couldn't reach Google Calendar. Try signing out and back in.",
+                title="Calendar access required",
+            )
+        return _error(str(exc), title="Could not list events")
+
+    if not events:
+        return _success(
+            "calendar_list",
+            "No upcoming events",
+            f"Your calendar is clear for the next {days_ahead} days.",
+            items=[],
+            meta={"count": 0, "days_ahead": days_ahead},
+        )
+
+    items = []
+    text_lines = []
+    for event in events:
+        summary = event.get("summary") or "(no title)"
+        start = event.get("start", {})
+        start_dt_str = start.get("dateTime") or start.get("date") or ""
+        when_label = start_dt_str
+        try:
+            if "T" in start_dt_str:
+                parsed = datetime.fromisoformat(start_dt_str.replace("Z", "+00:00"))
+                when_label = parsed.strftime("%a %d %b, %I:%M %p")
+            else:
+                parsed = datetime.fromisoformat(start_dt_str)
+                when_label = parsed.strftime("%a %d %b (all day)")
+        except Exception:
+            pass
+
+        location = event.get("location") or ""
+        description = (event.get("description") or "").strip()
+        event_link = event.get("htmlLink", "")
+        body_parts = []
+        if location:
+            body_parts.append(f"📍 {location}")
+        if description:
+            body_parts.append(description[:240])
+        body = "\n".join(body_parts) if body_parts else ""
+
+        items.append({
+            "title": summary,
+            "subtitle": when_label,
+            "body": body,
+        })
+        text_lines.append(f"• {summary} — {when_label}")
+
+    count = len(items)
+    summary_text = f"You have {count} upcoming event{'s' if count != 1 else ''} in the next {days_ahead} days."
+    export_text = "Upcoming events\n\n" + "\n".join(text_lines)
+
+    return _success(
+        "calendar_list",
+        "Upcoming events",
+        summary_text,
+        items=items,
+        meta={"count": count, "days_ahead": days_ahead},
+        export_text=export_text,
+    )
+
+
 def research_topic(user, topic):
     topic = (topic or "").strip()
     user_id = user["id"]
@@ -1220,6 +1364,11 @@ def handle_command(user, message, context=None):
             parsed.get("task", "Reminder"),
             parsed.get("time", ""),
             parsed.get("description", ""),
+        )
+    elif intent in {"list_events", "check_schedule"}:
+        response = list_upcoming_events(
+            user,
+            days_ahead=parsed.get("days_ahead") or 7,
         )
     elif intent in {"do_research", "research"}:
         response = research_topic(user, parsed.get("topic") or message)

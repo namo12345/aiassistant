@@ -14,6 +14,7 @@ from flask import (
 
 from services.assistant_service import (
     handle_command,
+    list_upcoming_events,
     research_topic,
     send_email_message,
     set_reminder,
@@ -163,6 +164,13 @@ def reminder_create():
             payload.get("duration_minutes", 60),
         )
     )
+
+
+@app.get("/api/events/upcoming")
+@require_auth
+def events_upcoming():
+    days = request.args.get("days", default=7, type=int)
+    return _payload_response(list_upcoming_events(request.current_user, days_ahead=days))
 
 
 @app.post("/api/research")

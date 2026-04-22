@@ -255,7 +255,15 @@ def summarize_text(text, instruction=None):
     return chat_completion(summary_prompt, text)
 
 
-def polish_message(raw_message, subject="", instruction=None, sender_name="", recipient_email="", recipient_name_hint=""):
+def polish_message(
+    raw_message,
+    subject="",
+    instruction=None,
+    sender_name="",
+    recipient_email="",
+    recipient_name_hint="",
+    contact_memory=None,
+):
     system_prompt = instruction or (
         "Rewrite the user's draft as a complete, natural-sounding email. "
         "Rules: "
@@ -275,5 +283,20 @@ def polish_message(raw_message, subject="", instruction=None, sender_name="", re
     ]
     if recipient_name_hint:
         user_prompt_parts.append(f"Recipient name hint (from email local-part): {recipient_name_hint}")
+
+    # Inject learned preferences for this specific contact, if any.
+    if contact_memory:
+        hint_lines = []
+        tone = (contact_memory.get("tone") or "").strip()
+        sign_off = (contact_memory.get("sign_off") or "").strip()
+        if tone:
+            hint_lines.append(f"- Preferred tone with this recipient (learned from past emails): {tone}")
+        if sign_off:
+            hint_lines.append(f"- Preferred sign-off with this recipient (learned from past emails): {sign_off}")
+        if hint_lines:
+            user_prompt_parts.append("")
+            user_prompt_parts.append("Recipient-specific preferences:")
+            user_prompt_parts.extend(hint_lines)
+
     user_prompt_parts.extend(["", "Draft:", raw_message])
     return chat_completion(system_prompt, "\n".join(user_prompt_parts))

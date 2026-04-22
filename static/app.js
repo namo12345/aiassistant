@@ -457,6 +457,8 @@ async function runFeature(feature, body) {
         let payload;
         if (feature === "inbox") {
             payload = await fetchJson("/api/mail/summary");
+        } else if (feature === "schedule") {
+            payload = await fetchJson("/api/events/upcoming?days=7");
         } else if (feature === "email") {
             payload = await fetchJson("/api/email/send", {
                 method: "POST",
@@ -497,6 +499,7 @@ async function runFeature(feature, body) {
 function featureLabel(feature) {
     switch (feature) {
         case "inbox": return "Summarize my inbox";
+        case "schedule": return "Show my upcoming events";
         case "email": return "Send an email";
         case "reminder": return "Set a reminder";
         case "research": return "Research a topic";
@@ -559,7 +562,7 @@ const FEATURE_TITLES = {
 };
 
 function handleFeatureClick(feature) {
-    if (feature === "inbox") { runFeature("inbox"); return; }
+    if (feature === "inbox" || feature === "schedule") { runFeature(feature); return; }
     const formBuilder = FEATURE_FORMS[feature];
     if (!formBuilder) return;
     openModal(FEATURE_TITLES[feature], `<form id="feature-form" data-feature="${feature}">${formBuilder()}</form>`);

@@ -78,6 +78,15 @@ def fetch_userinfo(access_token):
     return response.json()
 
 
+def _is_email_allowed(email):
+    """If ALLOWED_EMAILS is set, only those addresses can sign in. If unset, everyone can."""
+    raw = (os.getenv("ALLOWED_EMAILS") or "").strip()
+    if not raw:
+        return True
+    allow_list = {e.strip().lower() for e in raw.split(",") if e.strip()}
+    return email.lower() in allow_list
+
+
 def complete_oauth(code):
     """Run after Google redirects back with ?code=..."""
     tokens = exchange_code_for_tokens(code)
@@ -97,6 +106,12 @@ def complete_oauth(code):
 
     if not google_sub or not email:
         raise RuntimeError("Google userinfo missing required fields.")
+
+    if not _is_email_allowed(email):
+        raise RuntimeError(
+            f"Sign-in blocked: {email} is not on the access list. "
+            "Contact the app owner to be added."
+        )
 
     user = upsert_user(
         google_sub=google_sub,
