@@ -7,8 +7,27 @@ import re
 import tempfile
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 from pathlib import Path
 from uuid import uuid4
+
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:  # pragma: no cover
+    ZoneInfo = None
+
+# User's local timezone used for display + reminder storage.
+# Kept here so both list_upcoming_events and set_reminder agree on wall-clock time.
+LOCAL_TZ_NAME = "Asia/Kolkata"
+
+
+def _local_tz():
+    if ZoneInfo is None:
+        return timezone.utc
+    try:
+        return ZoneInfo(LOCAL_TZ_NAME)
+    except Exception:
+        return timezone.utc
 
 import dateparser
 import docx
@@ -608,6 +627,24 @@ def _build_gmail_message(recipient, subject, body_text):
     return {"raw": encoded}
 
 
+def _build_gmail_reply(recipient, subject, body_text, original_message_id, references):
+    """Build a reply MIME message with In-Reply-To + References so Gmail threads it."""
+    message = MIMEText(body_text)
+    message["to"] = recipient
+    message["subject"] = subject
+    if original_message_id:
+        message["In-Reply-To"] = original_message_id
+    if references:
+        message["References"] = references
+    message["Date"] = formatdate(localtime=True)
+    try:
+        message["Message-ID"] = make_msgid()
+    except Exception:
+        pass
+    encoded = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
+    return {"raw": encoded}
+
+
 def _is_calendar_auth_error(exc):
     lowered = str(exc).lower()
     return (
@@ -979,8 +1016,8 @@ def set_reminder(user, title, when_text, description="", duration_minutes=60):
         event_body = {
             "summary": title,
             "description": description,
-            "start": {"dateTime": parsed_time.isoformat(), "timeZone": "Asia/Kolkata"},
-            "end": {"dateTime": end_time.isoformat(), "timeZone": "Asia/Kolkata"},
+            "start": {"dateTime": parsed_time.isoformat(), "timeZone": LOCAL_TZ_NAME},
+            "end": {"dateTime": end_time.isoformat(), "timeZone": LOCAL_TZ_NAME},
         }
 
         try:
@@ -1172,6 +1209,7 @@ def list_upcoming_events(user, days_ahead=7, max_results=10):
 
     items = []
     text_lines = []
+    local_tz = _local_tz()
     for event in events:
         summary = event.get("summary") or "(no title)"
         start = event.get("start", {})
@@ -1180,7 +1218,12 @@ def list_upcoming_events(user, days_ahead=7, max_results=10):
         try:
             if "T" in start_dt_str:
                 parsed = datetime.fromisoformat(start_dt_str.replace("Z", "+00:00"))
-                when_label = parsed.strftime("%a %d %b, %I:%M %p")
+                # Google may return UTC ("Z") or the event's stored tz. Convert to the
+                # user's local wall-clock time so "10am" displayed matches what they set.
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                parsed_local = parsed.astimezone(local_tz)
+                when_label = parsed_local.strftime("%a %d %b, %I:%M %p")
             else:
                 parsed = datetime.fromisoformat(start_dt_str)
                 when_label = parsed.strftime("%a %d %b (all day)")
@@ -1190,6 +1233,7 @@ def list_upcoming_events(user, days_ahead=7, max_results=10):
         location = event.get("location") or ""
         description = (event.get("description") or "").strip()
         event_link = event.get("htmlLink", "")
+        event_id = event.get("id", "")
         body_parts = []
         if location:
             body_parts.append(f"📍 {location}")
@@ -1201,6 +1245,8 @@ def list_upcoming_events(user, days_ahead=7, max_results=10):
             "title": summary,
             "subtitle": when_label,
             "body": body,
+            "event_id": event_id,
+            "event_link": event_link,
         })
         text_lines.append(f"• {summary} — {when_label}")
 
@@ -1214,6 +1260,533 @@ def list_upcoming_events(user, days_ahead=7, max_results=10):
         summary_text,
         items=items,
         meta={"count": count, "days_ahead": days_ahead},
+        export_text=export_text,
+    )
+
+
+def _find_recent_message(service, query, max_results=5):
+    """Return the most recent Gmail message matching query, fully loaded."""
+    listing = (
+        service.users()
+        .messages()
+        .list(userId="me", q=query, maxResults=max_results)
+        .execute()
+    )
+    messages = listing.get("messages", [])
+    if not messages:
+        return None
+    return (
+        service.users()
+        .messages()
+        .get(userId="me", id=messages[0]["id"], format="full")
+        .execute()
+    )
+
+
+def reply_to_email(user, body, message_id="", query="", subject_hint="", polish=True):
+    """Reply to a specific email thread. Either message_id OR a Gmail search query must be provided."""
+    body = (body or "").strip()
+    query = (query or "").strip()
+    message_id = (message_id or "").strip()
+    user_id = user["id"]
+    strategy = select_strategy(user_id, "email_polish")
+
+    if not body:
+        return _error("Reply body is required.", title="Missing reply text")
+    if not message_id and not query:
+        return _error(
+            "Tell me which email to reply to (subject, sender, or a keyword).",
+            title="Missing thread",
+        )
+
+    try:
+        service = _get_gmail_service(user, GMAIL_SEND_SCOPE + GMAIL_READONLY_SCOPE)
+        if message_id:
+            message_data = (
+                service.users().messages().get(userId="me", id=message_id, format="full").execute()
+            )
+        else:
+            message_data = _find_recent_message(service, query)
+            if not message_data:
+                return _error(
+                    f'Could not find an email matching "{query}".',
+                    title="No matching email",
+                )
+
+        payload = message_data.get("payload", {})
+        headers = payload.get("headers", [])
+        original_subject = _header_value(headers, "Subject") or subject_hint or "(no subject)"
+        original_from = _header_value(headers, "From") or ""
+        original_msg_id_header = _header_value(headers, "Message-ID") or _header_value(headers, "Message-Id")
+        original_references = _header_value(headers, "References") or ""
+        thread_id = message_data.get("threadId")
+
+        # Gmail returns "Name <addr@x>" — reply target is the bare address.
+        recipient_match = re.search(r"<([^>]+)>", original_from)
+        recipient = (recipient_match.group(1) if recipient_match else original_from).strip()
+        if not recipient:
+            return _error("Could not determine the recipient from the original email.", title="Missing recipient")
+
+        reply_subject = original_subject if original_subject.lower().startswith("re:") else f"Re: {original_subject}"
+        references = (original_references + " " + original_msg_id_header).strip() if original_references else original_msg_id_header
+
+        sender_name = (user.get("name") or "").strip() or _derive_name_from_email(user.get("email", ""))
+        recipient_name = _derive_name_from_email(recipient)
+
+        contact_memory = None
+        try:
+            memory = get_user_memory(user_id) or {}
+            contacts = memory.get("contacts") or {}
+            contact_memory = contacts.get(recipient) or contacts.get(recipient.lower()) or None
+        except Exception:
+            contact_memory = None
+
+        polish_skipped_reason = ""
+        if polish:
+            try:
+                final_body = polish_message(
+                    body,
+                    subject=reply_subject,
+                    instruction=get_prompt_variant("email_polish", strategy),
+                    sender_name=sender_name,
+                    recipient_email=recipient,
+                    recipient_name_hint=recipient_name,
+                    contact_memory=contact_memory,
+                )
+            except Exception as polish_exc:
+                final_body = body
+                polish_skipped_reason = str(polish_exc)
+        else:
+            final_body = body
+
+        gmail_message = _build_gmail_reply(
+            recipient, reply_subject, final_body, original_msg_id_header, references
+        )
+        if thread_id:
+            gmail_message["threadId"] = thread_id
+        service.users().messages().send(userId="me", body=gmail_message).execute()
+
+        try:
+            learned_sign_off = _extract_sign_off(final_body)
+            learned_tone = "professional" if strategy == "professional" else "friendly"
+            merge_contact_hint(
+                user_id,
+                recipient.lower(),
+                tone=learned_tone,
+                sign_off=learned_sign_off or None,
+            )
+        except Exception:
+            pass
+
+        status_note = ""
+        if polish_skipped_reason:
+            status_note = f" Note: AI polishing was skipped ({polish_skipped_reason})."
+
+        export_text = "\n".join([
+            "Reply sent",
+            f"To: {recipient}",
+            f"Subject: {reply_subject}",
+            f"In reply to: {original_msg_id_header or 'n/a'}",
+            "",
+            final_body,
+        ])
+
+        return attach_trace(
+            _success(
+                "email_reply",
+                "Reply sent",
+                f"Replied to {_sender_name(original_from) or recipient} in thread \"{original_subject}\".{status_note}",
+                items=[{
+                    "title": reply_subject,
+                    "subtitle": f"To: {recipient}",
+                    "body": final_body,
+                }],
+                meta={
+                    "recipient": recipient,
+                    "thread_id": thread_id or "",
+                    "polish_skipped": bool(polish_skipped_reason),
+                },
+                export_text=export_text,
+            ),
+            user_id,
+            "email_polish",
+            strategy,
+            {"recipient": recipient, "thread_id": thread_id, "reply": True},
+        )
+    except Exception as exc:
+        return _error(str(exc), title="Could not send reply")
+
+
+def reschedule_event(user, new_when_text, event_id="", query="", duration_minutes=None):
+    """Move a Google Calendar event to a new time. Find by event_id or search query (summary match)."""
+    new_when_text = (new_when_text or "").strip()
+    event_id = (event_id or "").strip()
+    query = (query or "").strip()
+
+    if not new_when_text:
+        return _error("Tell me the new time for the event.", title="Missing new time")
+    if not event_id and not query:
+        return _error("Tell me which event to reschedule.", title="Missing event")
+
+    parsed_time = _parse_reminder_datetime(new_when_text)
+    if not parsed_time:
+        return _error(
+            "Could not understand the new time. Try something like 'tomorrow 4pm'.",
+            title="Invalid time",
+        )
+
+    try:
+        service = _get_calendar_service(user)
+
+        if not event_id:
+            lowered_query = query.lower()
+            time_min = datetime.now(timezone.utc).isoformat()
+            listing = (
+                service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=time_min,
+                    maxResults=25,
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            match = next(
+                (event for event in listing.get("items", [])
+                 if lowered_query in (event.get("summary", "") or "").lower()),
+                None,
+            )
+            if not match:
+                return _error(
+                    f'No upcoming event matched "{query}".',
+                    title="Event not found",
+                )
+            event_id = match["id"]
+            existing_event = match
+        else:
+            existing_event = (
+                service.events().get(calendarId="primary", eventId=event_id).execute()
+            )
+
+        try:
+            duration_minutes = int(duration_minutes) if duration_minutes else None
+        except (TypeError, ValueError):
+            duration_minutes = None
+        if not duration_minutes:
+            # Preserve the original event length when possible.
+            try:
+                start_iso = existing_event.get("start", {}).get("dateTime", "")
+                end_iso = existing_event.get("end", {}).get("dateTime", "")
+                if start_iso and end_iso:
+                    start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00"))
+                    end_dt = datetime.fromisoformat(end_iso.replace("Z", "+00:00"))
+                    duration_minutes = max(15, int((end_dt - start_dt).total_seconds() // 60))
+            except Exception:
+                duration_minutes = None
+        duration_minutes = max(15, min(int(duration_minutes or 60), 720))
+
+        end_time = parsed_time + timedelta(minutes=duration_minutes)
+        patch_body = {
+            "start": {"dateTime": parsed_time.isoformat(), "timeZone": LOCAL_TZ_NAME},
+            "end": {"dateTime": end_time.isoformat(), "timeZone": LOCAL_TZ_NAME},
+        }
+        updated = (
+            service.events()
+            .patch(calendarId="primary", eventId=event_id, body=patch_body)
+            .execute()
+        )
+
+        title = updated.get("summary") or existing_event.get("summary") or "(no title)"
+        when_label = parsed_time.strftime("%a %d %b, %I:%M %p")
+        event_link = updated.get("htmlLink", "")
+        export_text = "\n".join([
+            "Event rescheduled",
+            f"Title: {title}",
+            f"New time: {when_label}",
+            f"Duration: {duration_minutes} minutes",
+            f"Open: {event_link or 'N/A'}",
+        ])
+        return _success(
+            "reschedule",
+            "Event rescheduled",
+            f'"{title}" is now at {when_label}.',
+            items=[{
+                "title": title,
+                "subtitle": when_label,
+                "body": f"Duration: {duration_minutes} min" + (f"\nOpen: {event_link}" if event_link else ""),
+            }],
+            meta={"event_id": event_id, "event_link": event_link},
+            sources=[{"title": "Open in Google Calendar", "url": event_link}] if event_link else [],
+            export_text=export_text,
+        )
+    except Exception as exc:
+        return _error(str(exc), title="Could not reschedule event")
+
+
+def cancel_event(user, event_id="", query=""):
+    """Delete a Google Calendar event by id or by summary search."""
+    event_id = (event_id or "").strip()
+    query = (query or "").strip()
+
+    if not event_id and not query:
+        return _error("Tell me which event to cancel.", title="Missing event")
+
+    try:
+        service = _get_calendar_service(user)
+        title = ""
+
+        if not event_id:
+            lowered_query = query.lower()
+            time_min = datetime.now(timezone.utc).isoformat()
+            listing = (
+                service.events()
+                .list(
+                    calendarId="primary",
+                    timeMin=time_min,
+                    maxResults=25,
+                    singleEvents=True,
+                    orderBy="startTime",
+                )
+                .execute()
+            )
+            match = next(
+                (event for event in listing.get("items", [])
+                 if lowered_query in (event.get("summary", "") or "").lower()),
+                None,
+            )
+            if not match:
+                return _error(
+                    f'No upcoming event matched "{query}".',
+                    title="Event not found",
+                )
+            event_id = match["id"]
+            title = match.get("summary") or ""
+        else:
+            try:
+                existing = service.events().get(calendarId="primary", eventId=event_id).execute()
+                title = existing.get("summary") or ""
+            except Exception:
+                title = ""
+
+        service.events().delete(calendarId="primary", eventId=event_id).execute()
+
+        title = title or "(untitled event)"
+        export_text = f"Event cancelled\nTitle: {title}\nEvent id: {event_id}"
+        return _success(
+            "cancel",
+            "Event cancelled",
+            f'"{title}" has been removed from your calendar.',
+            items=[{"title": title, "subtitle": "Cancelled", "body": ""}],
+            meta={"event_id": event_id},
+            export_text=export_text,
+        )
+    except Exception as exc:
+        return _error(str(exc), title="Could not cancel event")
+
+
+def search_inbox(user, query, limit=5):
+    """Run a Gmail search (supports Gmail's `from:`, `subject:`, `after:` syntax) and summarize hits."""
+    query = (query or "").strip()
+    user_id = user["id"]
+    try:
+        limit = max(1, min(int(limit or 5), 10))
+    except (TypeError, ValueError):
+        limit = 5
+
+    if not query:
+        return _error("Enter a search query for your inbox.", title="Missing query")
+
+    strategy = select_strategy(user_id, "inbox_summary")
+
+    try:
+        service = _get_gmail_service(user, GMAIL_READONLY_SCOPE)
+        listing = (
+            service.users()
+            .messages()
+            .list(userId="me", q=query, maxResults=limit)
+            .execute()
+        )
+        message_stubs = listing.get("messages", [])
+        if not message_stubs:
+            return _success(
+                "mail_search",
+                "No matches",
+                f'No emails matched "{query}".',
+                meta={"query": query, "count": 0},
+                export_text=f"Inbox search: {query}\n\nNo matches.",
+            )
+
+        items = []
+        export_sections = []
+        for stub in message_stubs:
+            message_data = (
+                service.users().messages().get(userId="me", id=stub["id"], format="full").execute()
+            )
+            payload = message_data.get("payload", {})
+            headers = payload.get("headers", [])
+            subject = _header_value(headers, "Subject") or "No Subject"
+            sender = _header_value(headers, "From") or "Unknown sender"
+            snippet = message_data.get("snippet", "").strip()
+            body_text = _extract_email_body(payload).strip() or _clean_extracted_text(snippet, 280)
+            summary = _summarize_email_message(subject, sender, snippet, body_text, strategy)
+
+            items.append({
+                "title": subject,
+                "subtitle": f"From: {sender}",
+                "body": summary,
+                "message_id": stub["id"],
+            })
+            export_sections.append(
+                "\n".join([subject, f"From: {sender}", f"Summary: {summary}"])
+            )
+
+        count = len(items)
+        return attach_trace(
+            _success(
+                "mail_search",
+                "Inbox search",
+                f'Found {count} email{"s" if count != 1 else ""} matching "{query}".',
+                items=items,
+                meta={"query": query, "count": count},
+                export_text=f"Inbox search: {query}\n\n" + "\n\n".join(export_sections),
+            ),
+            user_id,
+            "inbox_summary",
+            strategy,
+            {"query": query, "count": count, "mode": "search"},
+        )
+    except Exception as exc:
+        return _error(str(exc), title="Could not search inbox")
+
+
+def daily_briefing(user):
+    """Stitch together today's events, a short inbox digest, and due reminders into one response."""
+    user_id = user["id"]
+
+    sections = []
+    items = []
+    meta_summary = {"has_inbox": False, "has_events": False, "has_reminders": False}
+
+    local_tz = _local_tz()
+    today_local = datetime.now(local_tz)
+    date_label = today_local.strftime("%A, %d %b %Y")
+
+    # 1) Today's calendar events (separate call so we can limit to today only).
+    try:
+        service = _get_calendar_service(user)
+        start_of_day = today_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = start_of_day + timedelta(days=1)
+        events_response = (
+            service.events()
+            .list(
+                calendarId="primary",
+                timeMin=start_of_day.astimezone(timezone.utc).isoformat(),
+                timeMax=end_of_day.astimezone(timezone.utc).isoformat(),
+                maxResults=15,
+                singleEvents=True,
+                orderBy="startTime",
+            )
+            .execute()
+        )
+        events = events_response.get("items", [])
+        if events:
+            meta_summary["has_events"] = True
+            event_lines = []
+            for event in events:
+                summary = event.get("summary") or "(no title)"
+                start = event.get("start", {})
+                start_dt_str = start.get("dateTime") or start.get("date") or ""
+                when_label = start_dt_str
+                try:
+                    if "T" in start_dt_str:
+                        parsed = datetime.fromisoformat(start_dt_str.replace("Z", "+00:00"))
+                        if parsed.tzinfo is None:
+                            parsed = parsed.replace(tzinfo=timezone.utc)
+                        when_label = parsed.astimezone(local_tz).strftime("%I:%M %p")
+                    else:
+                        when_label = "All day"
+                except Exception:
+                    pass
+                event_lines.append(f"• {when_label} — {summary}")
+                items.append({
+                    "title": summary,
+                    "subtitle": f"Today · {when_label}",
+                    "body": event.get("location") or "",
+                })
+            sections.append("📅 **Today's calendar**\n" + "\n".join(event_lines))
+        else:
+            sections.append("📅 **Today's calendar**\nYour calendar is clear for today.")
+    except Exception as exc:
+        sections.append(f"📅 **Today's calendar**\nCouldn't reach Google Calendar ({exc}).")
+
+    # 2) Top 3 inbox items (reuse the existing summarizer).
+    try:
+        inbox_payload = summarize_inbox(user, limit=3)
+        if inbox_payload.get("ok"):
+            inbox_response = inbox_payload["response"]
+            inbox_items = inbox_response.get("items") or []
+            if inbox_items:
+                meta_summary["has_inbox"] = True
+                lines = []
+                for it in inbox_items[:3]:
+                    title_line = it.get("title") or "(no subject)"
+                    preview = (it.get("body") or "").splitlines()[0][:160]
+                    lines.append(f"• **{title_line}** — {preview}")
+                    items.append({
+                        "title": title_line,
+                        "subtitle": it.get("subtitle") or "",
+                        "body": it.get("body") or "",
+                    })
+                sections.append("📬 **Inbox highlights**\n" + "\n".join(lines))
+            else:
+                sections.append("📬 **Inbox highlights**\nInbox is quiet.")
+        else:
+            inbox_text = inbox_payload.get("response", {}).get("text", "Inbox unavailable.")
+            sections.append(f"📬 **Inbox highlights**\n{inbox_text}")
+    except Exception as exc:
+        sections.append(f"📬 **Inbox highlights**\nCouldn't load inbox ({exc}).")
+
+    # 3) Due reminders from Supabase fallback table (ones we couldn't push to Google Calendar).
+    try:
+        client = get_supabase()
+        tomorrow_iso = (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()
+        reminder_rows = (
+            client.table("reminders")
+            .select("title, when_iso, description")
+            .eq("user_id", user_id)
+            .lte("when_iso", tomorrow_iso)
+            .order("when_iso")
+            .limit(10)
+            .execute()
+        )
+        reminders = reminder_rows.data or []
+        if reminders:
+            meta_summary["has_reminders"] = True
+            lines = []
+            for rem in reminders:
+                when_iso = rem.get("when_iso") or ""
+                try:
+                    parsed = datetime.fromisoformat(when_iso.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=local_tz)
+                    when_label = parsed.astimezone(local_tz).strftime("%a %I:%M %p")
+                except Exception:
+                    when_label = when_iso
+                lines.append(f"• {when_label} — {rem.get('title') or '(untitled)'}")
+            sections.append("⏰ **Due reminders**\n" + "\n".join(lines))
+    except Exception:
+        # Reminders are optional — failing silently is fine.
+        pass
+
+    text = "\n\n".join(sections)
+    export_text = f"Daily briefing for {date_label}\n\n{text}"
+    return _success(
+        "briefing",
+        f"Briefing · {date_label}",
+        text,
+        items=items,
+        meta=meta_summary,
         export_text=export_text,
     )
 
@@ -1358,6 +1931,21 @@ def handle_command(user, message, context=None):
             parsed.get("message", ""),
             polish=True,
         )
+    elif intent == "reply_email":
+        response = reply_to_email(
+            user,
+            body=parsed.get("message", "") or parsed.get("body", ""),
+            message_id=parsed.get("message_id", ""),
+            query=parsed.get("query", "") or parsed.get("subject", ""),
+            subject_hint=parsed.get("subject", ""),
+            polish=True,
+        )
+    elif intent == "search_inbox":
+        response = search_inbox(
+            user,
+            parsed.get("query", "") or parsed.get("topic", "") or message,
+            limit=parsed.get("limit") or 5,
+        )
     elif intent == "set_reminder":
         response = set_reminder(
             user,
@@ -1370,6 +1958,22 @@ def handle_command(user, message, context=None):
             user,
             days_ahead=parsed.get("days_ahead") or 7,
         )
+    elif intent == "reschedule_event":
+        response = reschedule_event(
+            user,
+            new_when_text=parsed.get("time", "") or parsed.get("new_time", ""),
+            event_id=parsed.get("event_id", ""),
+            query=parsed.get("query", "") or parsed.get("task", "") or parsed.get("title", ""),
+            duration_minutes=parsed.get("duration_minutes"),
+        )
+    elif intent == "cancel_event":
+        response = cancel_event(
+            user,
+            event_id=parsed.get("event_id", ""),
+            query=parsed.get("query", "") or parsed.get("task", "") or parsed.get("title", ""),
+        )
+    elif intent == "daily_briefing":
+        response = daily_briefing(user)
     elif intent in {"do_research", "research"}:
         response = research_topic(user, parsed.get("topic") or message)
     elif intent == "summarize_attachments":

@@ -8,16 +8,32 @@ from utils.intent_parser import parse_intent
 
 PROMPT_VARIANTS = {
     "strict_json": """
-You are the intent router for a productivity assistant with 5 real tools.
+You are the intent router for a productivity assistant with many real tools.
 Return ONLY a JSON object. No markdown, no prose, no explanation.
 
 Intents:
 - summarize_mails     -> the user wants their Gmail inbox summarized.
-- send_email          -> the user wants to send an email. Extract: email, subject (optional), message.
+- search_inbox        -> the user wants to find specific emails matching a query.
+                         Examples: "find emails from vercel", "any mails from sana last week",
+                         "search inbox for invoice". Extract: query (Gmail-compatible search
+                         string — use `from:`, `subject:`, `after:` hints when clear).
+- send_email          -> the user wants to send a NEW email. Extract: email, subject (optional), message.
+- reply_email         -> the user wants to REPLY to an existing email thread. Extract:
+                         query (subject or sender hint to find the thread), message (the reply text),
+                         optional: message_id, subject.
+                         Examples: "reply to the last email from sana saying I'll be there",
+                         "send a reply to the vercel email telling them it's resolved".
 - set_reminder        -> the user wants a calendar reminder. Extract: task, time, description (optional).
-- list_events         -> the user wants to see upcoming events / their schedule / what's planned.
-                         Examples: "what's on my schedule", "what's happening tomorrow",
-                         "my calendar this week", "any events coming up". Optional: days_ahead (int).
+- list_events         -> the user wants to see upcoming events / their schedule.
+                         Examples: "what's on my schedule", "my calendar this week". Optional: days_ahead.
+- reschedule_event    -> the user wants to MOVE an existing event to a new time. Extract:
+                         query (event title/keyword), time (new time), optional: event_id, duration_minutes.
+                         Examples: "move the standup to 4pm tomorrow", "reschedule my dentist to friday 11am".
+- cancel_event        -> the user wants to DELETE an event. Extract: query (event title/keyword).
+                         Examples: "cancel the 3pm meeting", "delete tomorrow's standup".
+- daily_briefing      -> the user wants a one-shot digest of today: inbox + calendar + reminders.
+                         Examples: "give me my briefing", "what's my day look like", "morning summary",
+                         "what should I know today".
 - do_research         -> ANY question that needs external/world knowledge to answer well:
                          facts, people, places, concepts, news, career advice, how-to, suggestions,
                          comparisons, current trends, recommendations, explanations. Extract: topic.
@@ -33,9 +49,14 @@ For do_research, the "topic" should be a concise search query (3-10 words), stri
 like "please tell me", "I want to know", "can you". Examples:
 - "I want to know about cats please tell me" -> topic: "cats"
 - "what is RAG" -> topic: "retrieval augmented generation"
-- "I want to land a job as an AI engineer, where should I start" -> topic: "how to become an AI engineer roadmap"
-- "suggest me some good books on machine learning" -> topic: "best machine learning books"
-- "recent AI trends" -> topic: "latest AI trends 2026"
+
+Disambiguation rules:
+- "send an email to X saying Y" => send_email
+- "reply to X saying Y" / "respond to the email from X" => reply_email
+- "find / search mails" => search_inbox (do NOT use summarize_mails unless the user just wants an overview)
+- "move / reschedule / push X to <time>" => reschedule_event
+- "cancel / delete / drop X" => cancel_event
+- "briefing / my day / what's up today" => daily_briefing
 
 Context handling: if a "Previous assistant message" is provided and the current user message
 is a short confirmation ("yes", "sure", "please do", "go ahead"), infer the intent and topic
@@ -49,20 +70,27 @@ Route the user's message to one of these tools for a browser productivity assist
 Return ONLY one JSON object.
 
 Tools:
-- summarize_mails: inbox summary.
-- send_email: send an email (fields: email, subject, message).
+- summarize_mails: inbox summary overview.
+- search_inbox: search Gmail (field: query — Gmail search syntax OK).
+- send_email: send a NEW email (fields: email, subject, message).
+- reply_email: reply to an existing thread (fields: query, message; optional message_id/subject).
 - set_reminder: create a calendar reminder (fields: task, time, description).
-- list_events: show upcoming calendar events / what's on the user's schedule (optional field: days_ahead).
-- do_research: anything requiring external knowledge — facts, advice, how-to, news, trends,
-               people, concepts, recommendations, comparisons (field: topic, a concise search query).
+- list_events: show upcoming calendar events (optional field: days_ahead).
+- reschedule_event: move an existing event (fields: query, time; optional duration_minutes/event_id).
+- cancel_event: delete an event (fields: query or event_id).
+- daily_briefing: combined digest of today's inbox, calendar, reminders — for "my day" questions.
+- do_research: anything requiring external knowledge (field: topic).
 - summarize_attachments: user referenced a file/doc/PDF to summarize.
 - general_chat: greetings, thanks, or meta questions about the assistant itself.
 
 Bias: when the user asks ANY factual or advice question, prefer do_research. Only use
 general_chat for pure social/conversational messages.
 
+Prefer reply_email over send_email when the user refers to an existing email/thread/conversation.
+Prefer reschedule_event / cancel_event over set_reminder when the user references an existing event.
+
 For short acknowledgements ("yes", "please do", "go ahead") when a Previous assistant message
-is provided, inherit the action the assistant proposed (usually do_research with the implied topic).
+is provided, inherit the action the assistant proposed.
 """,
 }
 

@@ -49,6 +49,13 @@ let autoSpeak = false;
 let isWorking = false;
 let currentUser = null;
 let feedbackState = {}; // trace_id -> {reward, label}
+let implicitRewardSent = {}; // trace_id -> true; track implicit rewards so we don't double-fire
+
+// Implicit-feedback reward — a small positive signal sent when the user engages
+// with a response (copy, speak, open a source/calendar link) but hasn't given
+// an explicit thumbs-up/down yet. Keeps the bandit learning even when users
+// don't bother to rate responses.
+const IMPLICIT_REWARD = 0.3;
 
 // -- Storage ---------------------------------------------------------------
 function saveMessages() {
@@ -459,6 +466,8 @@ async function runFeature(feature, body) {
             payload = await fetchJson("/api/mail/summary");
         } else if (feature === "schedule") {
             payload = await fetchJson("/api/events/upcoming?days=7");
+        } else if (feature === "briefing") {
+            payload = await fetchJson("/api/briefing");
         } else if (feature === "email") {
             payload = await fetchJson("/api/email/send", {
                 method: "POST",
@@ -500,6 +509,7 @@ function featureLabel(feature) {
     switch (feature) {
         case "inbox": return "Summarize my inbox";
         case "schedule": return "Show my upcoming events";
+        case "briefing": return "Give me today's briefing";
         case "email": return "Send an email";
         case "reminder": return "Set a reminder";
         case "research": return "Research a topic";
@@ -562,7 +572,7 @@ const FEATURE_TITLES = {
 };
 
 function handleFeatureClick(feature) {
-    if (feature === "inbox" || feature === "schedule") { runFeature(feature); return; }
+    if (feature === "inbox" || feature === "schedule" || feature === "briefing") { runFeature(feature); return; }
     const formBuilder = FEATURE_FORMS[feature];
     if (!formBuilder) return;
     openModal(FEATURE_TITLES[feature], `<form id="feature-form" data-feature="${feature}">${formBuilder()}</form>`);
@@ -637,6 +647,18 @@ document.addEventListener("keydown", (e) => {
 });
 
 messagesEl.addEventListener("click", (e) => {
+    // Implicit positive signal: the user clicked a source/citation/calendar link
+    // inside an assistant response. Treat it as a small reward.
+    const link = e.target.closest("a[href]");
+    if (link && messagesEl.contains(link)) {
+        const article = link.closest(".message.assistant");
+        if (article) {
+            const idx = Number(article.dataset.idx);
+            const entry = messages[idx];
+            if (entry) sendImplicitReward(entry, "link");
+        }
+    }
+
     const btn = e.target.closest("[data-act]");
     if (!btn) return;
     const article = btn.closest(".message");
@@ -647,16 +669,40 @@ messagesEl.addEventListener("click", (e) => {
     if (act === "copy") {
         const text = exportText(entry);
         navigator.clipboard.writeText(text).then(() => setStatus("Copied"));
+        sendImplicitReward(entry, "copy");
     } else if (act === "download") {
         const text = exportText(entry);
         downloadText("autopilot-response.txt", text);
+        sendImplicitReward(entry, "download");
     } else if (act === "speak") {
         const text = exportText(entry);
         speakText(text, btn);
+        sendImplicitReward(entry, "speak");
     } else if (act === "feedback-up" || act === "feedback-down") {
         submitFeedback(entry, act === "feedback-up" ? 1 : 0);
     }
 });
+
+async function sendImplicitReward(entry, source) {
+    const traceId = entry?.payload?.response?.meta?.trace_id;
+    if (!traceId) return;
+    // Don't overwrite explicit thumbs-up/down, and only fire once per trace.
+    if (feedbackState[traceId] || implicitRewardSent[traceId]) return;
+    implicitRewardSent[traceId] = true;
+    try {
+        await fetch("/api/feedback", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                trace_id: traceId,
+                reward: IMPLICIT_REWARD,
+                label: "implicit_positive",
+                comment: `implicit:${source}`,
+            }),
+        });
+    } catch { /* fire-and-forget — never break the UX */ }
+}
 
 async function submitFeedback(entry, reward) {
     const traceId = entry.payload?.response?.meta?.trace_id;

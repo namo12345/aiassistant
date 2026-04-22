@@ -13,9 +13,14 @@ from flask import (
 )
 
 from services.assistant_service import (
+    cancel_event,
+    daily_briefing,
     handle_command,
     list_upcoming_events,
+    reply_to_email,
     research_topic,
+    reschedule_event,
+    search_inbox,
     send_email_message,
     set_reminder,
     summarize_inbox,
@@ -171,6 +176,64 @@ def reminder_create():
 def events_upcoming():
     days = request.args.get("days", default=7, type=int)
     return _payload_response(list_upcoming_events(request.current_user, days_ahead=days))
+
+
+@app.post("/api/events/reschedule")
+@require_auth
+def events_reschedule():
+    payload = request.get_json(silent=True) or {}
+    return _payload_response(
+        reschedule_event(
+            request.current_user,
+            new_when_text=payload.get("when", "") or payload.get("time", ""),
+            event_id=payload.get("event_id", ""),
+            query=payload.get("query", ""),
+            duration_minutes=payload.get("duration_minutes"),
+        )
+    )
+
+
+@app.post("/api/events/cancel")
+@require_auth
+def events_cancel():
+    payload = request.get_json(silent=True) or {}
+    return _payload_response(
+        cancel_event(
+            request.current_user,
+            event_id=payload.get("event_id", ""),
+            query=payload.get("query", ""),
+        )
+    )
+
+
+@app.post("/api/email/reply")
+@require_auth
+def email_reply():
+    payload = request.get_json(silent=True) or {}
+    return _payload_response(
+        reply_to_email(
+            request.current_user,
+            body=payload.get("message", "") or payload.get("body", ""),
+            message_id=payload.get("message_id", ""),
+            query=payload.get("query", ""),
+            subject_hint=payload.get("subject", ""),
+            polish=bool(payload.get("polish", True)),
+        )
+    )
+
+
+@app.get("/api/mail/search")
+@require_auth
+def mail_search():
+    query = request.args.get("q", default="", type=str)
+    limit = request.args.get("limit", default=5, type=int)
+    return _payload_response(search_inbox(request.current_user, query, limit=limit))
+
+
+@app.get("/api/briefing")
+@require_auth
+def briefing():
+    return _payload_response(daily_briefing(request.current_user))
 
 
 @app.post("/api/research")
